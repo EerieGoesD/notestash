@@ -222,13 +222,22 @@ body {
   color: var(--text-dim);
 }
 .board-list {
-  flex: 1 1 auto;
+  flex: 1 1 0;
+  min-height: 40px;
   overflow-y: auto;
   padding: 2px 8px 10px;
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
+
+/* ── Archive entry (pinned at sidebar bottom) ── */
+.sidebar-bottom {
+  flex: 0 0 auto;
+  padding: 6px 8px 8px;
+  border-top: 1px solid var(--border);
+}
+.board-icon { font-size: 14px; line-height: 1; flex-shrink: 0; }
 .board-item {
   display: flex;
   align-items: center;
@@ -295,6 +304,44 @@ body {
   cursor: grab;
 }
 .board.is-panning { cursor: grabbing; }
+
+/* ── Archive view (a board-like page of archived notes) ── */
+.archive-view {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px 24px 24px;
+}
+.archive-head { margin-bottom: 16px; }
+.archive-head h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+}
+.archive-sub { font-size: 12.5px; color: var(--text-dim); }
+.archive-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+.archive-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+}
+.archive-card .card-body {
+  -webkit-line-clamp: 6;
+}
+.archive-card-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+.archive-card-actions .btn { padding: 5px 12px; font-size: 12.5px; }
 
 /* ── Column ── */
 .column {
@@ -516,8 +563,9 @@ body {
   padding: 24px;
 }
 .modal {
-  width: 460px;
+  width: 560px;
   max-width: 100%;
+  height: min(82vh, 720px);
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -568,8 +616,9 @@ body {
   line-height: 1.5;
   padding: 10px 12px;
   outline: none;
-  resize: vertical;
-  min-height: 200px;
+  resize: none;
+  flex: 1 1 auto;
+  min-height: 0;
   transition: border-color 0.15s;
 }
 .modal-body:focus { border-color: var(--accent); }
@@ -587,7 +636,7 @@ body {
 }
 
 /* ── Collapsed label control + popover (in the note editor) ── */
-.label-control { position: relative; margin-left: auto; }
+.label-control { position: relative; }
 .label-trigger {
   display: flex;
   align-items: center;
@@ -618,7 +667,7 @@ body {
 .label-popover-backdrop { position: fixed; inset: 0; z-index: 130; }
 .label-popover {
   position: absolute;
-  bottom: calc(100% + 6px);
+  top: calc(100% + 6px);
   right: 0;
   width: 250px;
   z-index: 131;
@@ -628,6 +677,7 @@ body {
   padding: 10px;
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
 }
+.label-popover.up { top: auto; bottom: calc(100% + 6px); }
 .label-picker { display: flex; flex-direction: column; gap: 6px; }
 .label-pick-row { display: flex; align-items: center; gap: 8px; }
 .label-color {
@@ -721,6 +771,28 @@ body {
   transition: background 0.12s, color 0.12s;
 }
 .context-menu-delete:hover { background: rgba(239, 68, 68, 0.14); color: var(--danger-h); }
+.ctx-swatches { display: flex; flex-wrap: wrap; gap: 6px; }
+.ctx-swatch {
+  width: 28px;
+  height: 28px;
+  border: 2px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  padding: 0;
+  font-size: 13px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.1s, border-color 0.1s;
+}
+.ctx-swatch:hover { transform: scale(1.1); }
+.ctx-swatch.active { border-color: var(--text); }
+.ctx-swatch-none {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
 
 /* ── Scrollbars ── */
 ::-webkit-scrollbar { width: 9px; height: 9px; }

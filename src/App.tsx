@@ -16,12 +16,15 @@ import "./App.css";
 type Card = { id: string; title: string; body: string; label: string; createdAt: number };
 type Column = { id: string; title: string; cards: Card[] };
 type Board = { id: string; title: string; columns: Column[] };
+// An archived (binned) note keeps where it came from so it can be restored.
+type ArchivedCard = { card: Card; boardId: string; colId: string; archivedAt: number };
 // `labels` maps a color key to the name the user gave it (Trello-style).
 type Workspace = {
   version: number;
   boards: Board[];
   activeBoardId: string;
   labels: Record<string, string>;
+  archived: ArchivedCard[];
 };
 
 // Fixed color palette. The value is the swatch color; the name lives in workspace.labels.
@@ -92,7 +95,7 @@ function makeNewBoard(title: string): Board {
 
 function makeDefaultWorkspace(): Workspace {
   const b = makeFirstBoard();
-  return { version: 2, boards: [b], activeBoardId: b.id, labels: makeDefaultLabels() };
+  return { version: 2, boards: [b], activeBoardId: b.id, labels: makeDefaultLabels(), archived: [] };
 }
 
 // ── Defensive coercion (handles old single-board / unlabeled saves too) ──
@@ -131,8 +134,19 @@ function normalizeLabels(raw: any): Record<string, string> {
   return out;
 }
 
+function normalizeArchived(raw: any): ArchivedCard[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((a: any) => ({
+    card: normalizeCard(a?.card),
+    boardId: typeof a?.boardId === "string" ? a.boardId : "",
+    colId: typeof a?.colId === "string" ? a.colId : "",
+    archivedAt: typeof a?.archivedAt === "number" ? a.archivedAt : Date.now(),
+  }));
+}
+
 function normalizeWorkspace(raw: any): Workspace {
   const labels = normalizeLabels(raw?.labels);
+  const archived = normalizeArchived(raw?.archived);
   // New format: { boards: [...] }
   if (Array.isArray(raw?.boards) && raw.boards.length) {
     const boards = raw.boards.map(normalizeBoard);
@@ -140,12 +154,12 @@ function normalizeWorkspace(raw: any): Workspace {
       typeof raw?.activeBoardId === "string" && boards.some((b: Board) => b.id === raw.activeBoardId)
         ? raw.activeBoardId
         : boards[0].id;
-    return { version: 2, boards, activeBoardId, labels };
+    return { version: 2, boards, activeBoardId, labels, archived };
   }
   // Old single-board format: { columns: [...] } -> wrap into one board
   if (Array.isArray(raw?.columns)) {
     const b = normalizeBoard({ ...raw, title: "My Board" });
-    return { version: 2, boards: [b], activeBoardId: b.id, labels };
+    return { version: 2, boards: [b], activeBoardId: b.id, labels, archived };
   }
   return makeDefaultWorkspace();
 }
@@ -170,6 +184,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(
     () => localStorage.getItem("notestash.sidebar") !== "closed"
   );
+  const [showArchive, setShowArchive] = useState(false);
   const [query, setQuery] = useState("");
   const [editingBoardId, setEditingBoardId] = useState<string | null>(null);
   const [editingCard, setEditingCard] = useState<{ colId: string; card: Card } | null>(null);
@@ -191,6 +206,7 @@ export default function App() {
   const activeBoard =
     workspace.boards.find((b) => b.id === workspace.activeBoardId) ?? workspace.boards[0];
   const labels = workspace.labels;
+  const archived = workspace.archived;
 
   // ── Load saved workspace on startup ──
   useEffect(() => {
@@ -258,6 +274,7 @@ export default function App() {
     const b = makeNewBoard("New Board");
     setWorkspace((ws) => ({ ...ws, boards: [...ws.boards, b], activeBoardId: b.id }));
     setEditingBoardId(b.id);
+    setShowArchive(false);
   };
 
   const renameBoard = (id: string, title: string) =>
@@ -286,8 +303,10 @@ export default function App() {
     });
   };
 
-  const selectBoard = (id: string) =>
+  const selectBoard = (id: string) => {
     setWorkspace((ws) => ({ ...ws, activeBoardId: id }));
+    setShowArchive(false);
+  };
 
   // ── Column operations (on the active board) ──
   const addColumn = () =>
@@ -481,6 +500,46 @@ export default function App() {
       ),
     }));
 
+  // ── Archive (soft delete): move a note off the board into the bin ──
+  const archiveCard = (colId: string, card: Card) =>
+    setWorkspace((ws) => {
+      const boards = ws.boards.map((b) =>
+        b.id === ws.activeBoardId
+          ? {
+              ...b,
+              columns: b.columns.map((c) =>
+                c.id === colId ? { ...c, cards: c.cards.filter((cd) => cd.id !== card.id) } : c
+              ),
+            }
+          : b
+      );
+      const entry: ArchivedCard = { card, boardId: ws.activeBoardId, colId, archivedAt: Date.now() };
+      return { ...ws, boards, archived: [entry, ...ws.archived] };
+    });
+
+  // Restore a note to its original board/column (or the first one if that's gone).
+  const restoreCard = (cardId: string) =>
+    setWorkspace((ws) => {
+      const entry = ws.archived.find((a) => a.card.id === cardId);
+      if (!entry) return ws;
+      const archivedRest = ws.archived.filter((a) => a.card.id !== cardId);
+      const boards = ws.boards.map((b) => ({
+        ...b,
+        columns: b.columns.map((c) => ({ ...c, cards: [...c.cards] })),
+      }));
+      const board = boards.find((b) => b.id === entry.boardId) ?? boards[0];
+      if (!board || board.columns.length === 0) return { ...ws, archived: archivedRest };
+      const col = board.columns.find((c) => c.id === entry.colId) ?? board.columns[0];
+      col.cards.push(entry.card);
+      return { ...ws, boards, archived: archivedRest };
+    });
+
+  const deleteArchived = async (cardId: string, title: string) => {
+    if (!(await confirmDelete(`Permanently delete ${title ? `"${title}"` : "this note"}? This can't be undone.`)))
+      return;
+    setWorkspace((ws) => ({ ...ws, archived: ws.archived.filter((a) => a.card.id !== cardId) }));
+  };
+
   const moveCard = (
     cardId: string,
     fromColId: string,
@@ -649,7 +708,9 @@ export default function App() {
             {workspace.boards.map((b) => (
               <div
                 key={b.id}
-                className={"board-item" + (b.id === workspace.activeBoardId ? " active" : "")}
+                className={
+                  "board-item" + (!showArchive && b.id === workspace.activeBoardId ? " active" : "")
+                }
                 onClick={() => selectBoard(b.id)}
               >
                 {editingBoardId === b.id ? (
@@ -695,10 +756,71 @@ export default function App() {
               </div>
             ))}
           </div>
+
+          <div className="sidebar-bottom">
+            <div
+              className={"board-item" + (showArchive ? " active" : "")}
+              onClick={() => setShowArchive(true)}
+            >
+              <span className="board-icon">🗑</span>
+              <span className="board-name">Archive</span>
+              {archived.length > 0 && <span className="count">{archived.length}</span>}
+            </div>
+          </div>
         </aside>
 
-        <main className="board" ref={boardRef} onMouseDown={onPanStart}>
-          {activeBoard.columns.map((col, colIndex) => (
+        {showArchive ? (
+          <main className="archive-view">
+            <div className="archive-head">
+              <h2>Archived notes</h2>
+              <span className="archive-sub">
+                {archived.length === 0
+                  ? "Nothing here yet"
+                  : `${archived.length} note${archived.length === 1 ? "" : "s"} - restore one to a board, or delete it for good`}
+              </span>
+            </div>
+            {archived.length > 0 && (
+              <div className="archive-grid">
+                {archived.map((a) => (
+                  <article className="archive-card" key={a.card.id}>
+                    {a.card.label &&
+                      (labels[a.card.label] ? (
+                        <span
+                          className="card-chip"
+                          style={{
+                            background: LABEL_COLORS[a.card.label],
+                            color: LABEL_TEXT[a.card.label],
+                          }}
+                        >
+                          {labels[a.card.label]}
+                        </span>
+                      ) : (
+                        <div
+                          className="card-label"
+                          style={{ background: LABEL_COLORS[a.card.label] }}
+                        />
+                      ))}
+                    <div className="card-title">{a.card.title || "Untitled note"}</div>
+                    {a.card.body && <div className="card-body">{a.card.body}</div>}
+                    <div className="archive-card-actions">
+                      <button className="btn btn-ghost" onClick={() => restoreCard(a.card.id)}>
+                        Restore
+                      </button>
+                      <button
+                        className="btn btn-danger"
+                        onClick={() => deleteArchived(a.card.id, a.card.title)}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </main>
+        ) : (
+          <main className="board" ref={boardRef} onMouseDown={onPanStart}>
+            {activeBoard.columns.map((col, colIndex) => (
             <section
               key={col.id}
               className={
@@ -828,7 +950,8 @@ export default function App() {
               <Composer onAdd={(title, body) => addCard(col.id, title, body)} />
             </section>
           ))}
-        </main>
+          </main>
+        )}
       </div>
 
       <footer className="global-footer">
@@ -841,15 +964,15 @@ export default function App() {
           <span>Made by</span>
           <a className="link-eerie" onClick={link("https://eeriegoesd.com")}>EERIE</a>
           <span className="sep">|</span>
-          <a className="link-dim" onClick={link("https://github.com/EerieGoesD/notestash/issues/new")}>
+          <a className="link-dim" onClick={link("https://github.com/EerieGoesD/notestash/issues/new?template=bug-report.md")}>
             Report Issue
           </a>
           <span className="sep">|</span>
-          <a className="link-dim" onClick={link("https://github.com/EerieGoesD/notestash/discussions/new/choose")}>
+          <a className="link-dim" onClick={link("https://github.com/EerieGoesD/notestash/discussions")}>
             Feedback
           </a>
           <span className="sep">|</span>
-          <a className="link-dim" onClick={link("https://github.com/EerieGoesD/notestash/issues/new?labels=enhancement")}>
+          <a className="link-dim" onClick={link("https://github.com/EerieGoesD/notestash/issues/new?template=feature-request.md")}>
             Feature Request
           </a>
         </div>
@@ -874,7 +997,7 @@ export default function App() {
             onMouseDown={(e) => e.stopPropagation()}
           >
             <div className="context-menu-title">Label</div>
-            <LabelPicker
+            <LabelDropdown
               labels={labels}
               currentLabel={cardMenu.card.label}
               onAssign={(color) => {
@@ -891,6 +1014,15 @@ export default function App() {
               }}
             >
               Open note
+            </button>
+            <button
+              className="context-menu-open"
+              onClick={() => {
+                archiveCard(cardMenu.colId, cardMenu.card);
+                setCardMenu(null);
+              }}
+            >
+              Archive note
             </button>
             <button
               className="context-menu-delete"
@@ -923,6 +1055,10 @@ export default function App() {
             const colId = editingCard.colId;
             if (!(await confirmDelete(`Delete ${c.title ? `"${c.title}"` : "this note"}?`))) return;
             deleteCard(colId, c.id);
+            setEditingCard(null);
+          }}
+          onArchive={() => {
+            archiveCard(editingCard.colId, editingCard.card);
             setEditingCard(null);
           }}
           onClose={() => setEditingCard(null)}
@@ -1025,6 +1161,58 @@ function LabelPicker({
   );
 }
 
+// ── Collapsed label dropdown: a trigger that shows the current label, and
+//    a popover (with color + name) to pick or rename. Shared by the note
+//    editor and the right-click menu. ──
+function LabelDropdown({
+  labels,
+  currentLabel,
+  onAssign,
+  onRename,
+  direction = "down",
+}: {
+  labels: Record<string, string>;
+  currentLabel: string;
+  onAssign: (color: string) => void;
+  onRename: (color: string, name: string) => void;
+  direction?: "up" | "down";
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="label-control">
+      <button type="button" className="label-trigger" onClick={() => setOpen((v) => !v)}>
+        {currentLabel ? (
+          <span
+            className="trigger-chip"
+            style={{ background: LABEL_COLORS[currentLabel], color: LABEL_TEXT[currentLabel] }}
+          >
+            {labels[currentLabel] || currentLabel}
+          </span>
+        ) : (
+          <span className="trigger-none">No label</span>
+        )}
+        <span className="trigger-caret">▾</span>
+      </button>
+      {open && (
+        <>
+          <div className="label-popover-backdrop" onClick={() => setOpen(false)} />
+          <div className={"label-popover" + (direction === "up" ? " up" : "")}>
+            <LabelPicker
+              labels={labels}
+              currentLabel={currentLabel}
+              onAssign={(c) => {
+                onAssign(c);
+                setOpen(false);
+              }}
+              onRename={onRename}
+            />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── Quick-add composer: a single line that expands to reveal a details
 //    field once you click into it (so people see details are possible). ──
 function Composer({ onAdd }: { onAdd: (title: string, body: string) => void }) {
@@ -1092,6 +1280,7 @@ function CardEditor({
   onRenameLabel,
   onSave,
   onDelete,
+  onArchive,
   onClose,
 }: {
   card: Card;
@@ -1099,12 +1288,12 @@ function CardEditor({
   onRenameLabel: (color: string, name: string) => void;
   onSave: (c: Card) => void;
   onDelete: () => void;
+  onArchive: () => void;
   onClose: () => void;
 }) {
   const [title, setTitle] = useState(card.title);
   const [body, setBody] = useState(card.body);
   const [label, setLabel] = useState(card.label);
-  const [showLabels, setShowLabels] = useState(false);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1133,44 +1322,17 @@ function CardEditor({
         />
         <div className="modal-field-row">
           <span className="label-caption">Label</span>
-          <div className="label-control">
-            <button
-              type="button"
-              className="label-trigger"
-              onClick={() => setShowLabels((v) => !v)}
-            >
-              {label ? (
-                <span
-                  className="trigger-chip"
-                  style={{ background: LABEL_COLORS[label], color: LABEL_TEXT[label] }}
-                >
-                  {labels[label] || label}
-                </span>
-              ) : (
-                <span className="trigger-none">No label</span>
-              )}
-              <span className="trigger-caret">▾</span>
-            </button>
-            {showLabels && (
-              <>
-                <div className="label-popover-backdrop" onClick={() => setShowLabels(false)} />
-                <div className="label-popover">
-                  <LabelPicker
-                    labels={labels}
-                    currentLabel={label}
-                    onAssign={(c) => {
-                      setLabel(c);
-                      setShowLabels(false);
-                    }}
-                    onRename={onRenameLabel}
-                  />
-                </div>
-              </>
-            )}
-          </div>
+          <LabelDropdown
+            labels={labels}
+            currentLabel={label}
+            onAssign={setLabel}
+            onRename={onRenameLabel}
+            direction="up"
+          />
         </div>
         <div className="modal-actions">
           <button className="btn btn-danger" onClick={onDelete}>Delete</button>
+          <button className="btn btn-ghost" onClick={onArchive}>Archive</button>
           <div className="spacer" />
           <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
           <button
