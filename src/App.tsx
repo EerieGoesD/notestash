@@ -1,4 +1,5 @@
 import {
+  type ClipboardEvent as ReactClipboardEvent,
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
@@ -13,7 +14,17 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
 // ── Data model ──────────────────────────────────────────────────────
-type Card = { id: string; title: string; body: string; label: string; createdAt: number };
+type Card = {
+  id: string;
+  title: string;
+  body: string;
+  label: string;
+  images: string[];
+  coverX: number; // cover image focal point, 0-100 (object-position)
+  coverY: number;
+  coverZoom: number; // cover image scale, 1 = fit
+  createdAt: number;
+};
 type Column = { id: string; title: string; cards: Card[] };
 type Board = { id: string; title: string; columns: Column[] };
 // An archived (binned) note keeps where it came from so it can be restored.
@@ -47,6 +58,114 @@ const LABEL_TEXT: Record<string, string> = {
 };
 const LABELS = Object.keys(LABEL_COLORS);
 
+// ── Image helpers (pasted images are stored as files, referenced by name) ──
+function extFromMime(mime: string): string {
+  if (mime === "image/jpeg") return "jpg";
+  if (mime === "image/gif") return "gif";
+  if (mime === "image/webp") return "webp";
+  if (mime === "image/bmp") return "bmp";
+  return "png";
+}
+function mimeFromName(name: string): string {
+  const ext = name.split(".").pop()?.toLowerCase() ?? "png";
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "gif") return "image/gif";
+  if (ext === "webp") return "image/webp";
+  if (ext === "bmp") return "image/bmp";
+  return "image/png";
+}
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+// Cache loaded image data URLs by file name so cards don't re-read from disk.
+const imageUrlCache = new Map<string, string>();
+
+// The object-position + scale that frames a card's cover image.
+function coverStyle(card: Card): CSSProperties {
+  return {
+    objectPosition: `${card.coverX}% ${card.coverY}%`,
+    transform: `scale(${card.coverZoom})`,
+    transformOrigin: `${card.coverX}% ${card.coverY}%`,
+  };
+}
+
+// Loads a stored image by file name and renders it (cached across the app).
+function NoteImage({
+  fileName,
+  className,
+  style,
+}: {
+  fileName: string;
+  className?: string;
+  style?: CSSProperties;
+}) {
+  const [src, setSrc] = useState<string | null>(() => imageUrlCache.get(fileName) ?? null);
+  useEffect(() => {
+    const cached = imageUrlCache.get(fileName);
+    if (cached) {
+      setSrc(cached);
+      return;
+    }
+    let alive = true;
+    invoke<string>("load_image", { fileName })
+      .then((b64) => {
+        const url = `data:${mimeFromName(fileName)};base64,${b64}`;
+        imageUrlCache.set(fileName, url);
+        if (alive) setSrc(url);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [fileName]);
+  if (!src) return <div className={"note-image-loading" + (className ? " " + className : "")} />;
+  return <img className={className} src={src} alt="" draggable={false} style={style} />;
+}
+
+// The inner visual of a card (cover, label, title, body). Shared by the real
+// card and the floating drag ghost so they always match.
+function CardContent({
+  card,
+  labels,
+  cardView,
+}: {
+  card: Card;
+  labels: Record<string, string>;
+  cardView: CardView;
+}) {
+  return (
+    <>
+      {card.images.length > 0 && (
+        <div className="card-cover-wrap clickable" title="Click to reposition the image">
+          <NoteImage fileName={card.images[0]} className="card-cover" style={coverStyle(card)} />
+        </div>
+      )}
+      {card.label &&
+        (labels[card.label] ? (
+          <span
+            className="card-chip"
+            style={{ background: LABEL_COLORS[card.label], color: LABEL_TEXT[card.label] }}
+          >
+            {labels[card.label]}
+          </span>
+        ) : (
+          <div className="card-label" style={{ background: LABEL_COLORS[card.label] }} />
+        ))}
+      <div className="card-title">{card.title || "Untitled note"}</div>
+      {cardView === "details" && card.body && <div className="card-body">{card.body}</div>}
+    </>
+  );
+}
+
 const uid = () =>
   typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
@@ -68,8 +187,12 @@ function makeFirstBoard(): Board {
           {
             id: uid(),
             title: "Welcome to NoteStash",
-            body: "Type a quick note below, hit Add, then drag cards between columns. Add more boards in the sidebar on the left, search every board from the box up top, and right-click a note to give it a colored label.",
+            body: "Type a quick note below, hit Add, then drag cards between columns. Add more boards in the sidebar on the left, search every board from the box up top, right-click a note to give it a colored label, and paste an image into an open note to attach it.",
             label: "",
+            images: [],
+            coverX: 50,
+            coverY: 50,
+            coverZoom: 1,
             createdAt: Date.now(),
           },
         ],
@@ -105,6 +228,10 @@ function normalizeCard(raw: any): Card {
     title: typeof raw?.title === "string" ? raw.title : "",
     body: typeof raw?.body === "string" ? raw.body : "",
     label: typeof raw?.label === "string" && raw.label in LABEL_COLORS ? raw.label : "",
+    images: Array.isArray(raw?.images) ? raw.images.filter((s: any) => typeof s === "string") : [],
+    coverX: typeof raw?.coverX === "number" ? raw.coverX : 50,
+    coverY: typeof raw?.coverY === "number" ? raw.coverY : 50,
+    coverZoom: typeof raw?.coverZoom === "number" && raw.coverZoom >= 1 ? raw.coverZoom : 1,
     createdAt: typeof raw?.createdAt === "number" ? raw.createdAt : Date.now(),
   };
 }
@@ -189,12 +316,14 @@ export default function App() {
   const [editingBoardId, setEditingBoardId] = useState<string | null>(null);
   const [editingCard, setEditingCard] = useState<{ colId: string; card: Card } | null>(null);
   const [editingColId, setEditingColId] = useState<string | null>(null);
+  const [adjustingCover, setAdjustingCover] = useState<{ colId: string; card: Card } | null>(null);
   const [cardMenu, setCardMenu] = useState<CardMenu | null>(null);
   const [confirmState, setConfirmState] = useState<
     { message: string; okLabel: string; resolve: (v: boolean) => void } | null
   >(null);
   const [dragCard, setDragCard] = useState<DragCard | null>(null);
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
+  const [dragGhost, setDragGhost] = useState<{ x: number; y: number; width: number } | null>(null);
   const [colDrag, setColDrag] = useState<ColDrag | null>(null);
   const [status, setStatus] = useState<string>("");
 
@@ -202,6 +331,10 @@ export default function App() {
   const boardRef = useRef<HTMLDivElement | null>(null);
   const colDragRef = useRef<ColDrag | null>(null);
   const colGeomRef = useRef<{ centers: number[]; slot: number; startX: number } | null>(null);
+  const dropTargetRef = useRef<DropTarget | null>(null);
+  const dragCardIdRef = useRef<string | null>(null);
+  const cardPointerRef = useRef<{ x: number; y: number } | null>(null);
+  const cardScrollRafRef = useRef<number | null>(null);
 
   const activeBoard =
     workspace.boards.find((b) => b.id === workspace.activeBoardId) ?? workspace.boards[0];
@@ -471,6 +604,10 @@ export default function App() {
       title: t,
       body: body.trim(),
       label: "",
+      images: [],
+      coverX: 50,
+      coverY: 50,
+      coverZoom: 1,
       createdAt: Date.now(),
     };
     updateActiveBoard((b) => ({
@@ -492,13 +629,16 @@ export default function App() {
   const setCardLabel = (colId: string, card: Card, color: string) =>
     saveCard(colId, { ...card, label: color });
 
-  const deleteCard = (colId: string, cardId: string) =>
+  const deleteCard = (colId: string, cardId: string) => {
+    const card = activeBoard.columns.find((c) => c.id === colId)?.cards.find((cd) => cd.id === cardId);
+    card?.images.forEach((f) => invoke("delete_image", { fileName: f }).catch(() => {}));
     updateActiveBoard((b) => ({
       ...b,
       columns: b.columns.map((c) =>
         c.id === colId ? { ...c, cards: c.cards.filter((cd) => cd.id !== cardId) } : c
       ),
     }));
+  };
 
   // ── Archive (soft delete): move a note off the board into the bin ──
   const archiveCard = (colId: string, card: Card) =>
@@ -537,6 +677,8 @@ export default function App() {
   const deleteArchived = async (cardId: string, title: string) => {
     if (!(await confirmDelete(`Permanently delete ${title ? `"${title}"` : "this note"}? This can't be undone.`)))
       return;
+    const entry = workspace.archived.find((a) => a.card.id === cardId);
+    entry?.card.images.forEach((f) => invoke("delete_image", { fileName: f }).catch(() => {}));
     setWorkspace((ws) => ({ ...ws, archived: ws.archived.filter((a) => a.card.id !== cardId) }));
   };
 
@@ -562,9 +704,135 @@ export default function App() {
       return { ...b, columns: cols };
     });
 
-  const clearDrag = () => {
-    setDragCard(null);
-    setDropTarget(null);
+  const findCard = (colId: string, cardId: string): Card | null =>
+    activeBoard.columns.find((c) => c.id === colId)?.cards.find((cd) => cd.id === cardId) ?? null;
+
+  // Scroll a cards column when the drag pointer nears its top/bottom edge.
+  const autoScrollCards = (scroller: HTMLElement, clientY: number) => {
+    const r = scroller.getBoundingClientRect();
+    const edge = 64;
+    const maxSpeed = 22;
+    if (clientY < r.top + edge) {
+      const d = Math.min(1, (r.top + edge - clientY) / edge);
+      scroller.scrollTop -= Math.ceil(maxSpeed * d);
+    } else if (clientY > r.bottom - edge) {
+      const d = Math.min(1, (clientY - (r.bottom - edge)) / edge);
+      scroller.scrollTop += Math.ceil(maxSpeed * d);
+    }
+  };
+
+  // Figure out which column and insertion point the pointer is over, from the DOM.
+  const updateCardDropTarget = (x: number, y: number, draggedId: string) => {
+    const el = document.elementFromPoint(x, y) as HTMLElement | null;
+    const colSection = el?.closest<HTMLElement>(".column");
+    if (!colSection) return;
+    const colId = colSection.getAttribute("data-col-id");
+    if (!colId) return;
+    const cardsEl = colSection.querySelector<HTMLElement>(".cards");
+    let beforeCardId: string | null = null;
+    if (cardsEl) {
+      for (const ce of Array.from(cardsEl.querySelectorAll<HTMLElement>(".card"))) {
+        const cid = ce.getAttribute("data-card-id");
+        if (!cid || cid === draggedId) continue;
+        const r = ce.getBoundingClientRect();
+        if (y < r.top + r.height / 2) {
+          beforeCardId = cid;
+          break;
+        }
+      }
+    }
+    const prev = dropTargetRef.current;
+    if (prev && prev.colId === colId && prev.beforeCardId === beforeCardId) return;
+    const next = { colId, beforeCardId };
+    dropTargetRef.current = next;
+    setDropTarget(next);
+  };
+
+  // Continuous auto-scroll loop (rAF works because this is a pointer drag, not
+  // a native HTML5 drag). Also refreshes the drop indicator as content scrolls.
+  const startCardScrollLoop = () => {
+    const loop = () => {
+      const pos = cardPointerRef.current;
+      if (pos) {
+        const el = document.elementFromPoint(pos.x, pos.y) as HTMLElement | null;
+        const scroller = el?.closest<HTMLElement>(".cards");
+        if (scroller) {
+          autoScrollCards(scroller, pos.y);
+          if (dragCardIdRef.current) updateCardDropTarget(pos.x, pos.y, dragCardIdRef.current);
+        }
+      }
+      cardScrollRafRef.current = requestAnimationFrame(loop);
+    };
+    cardScrollRafRef.current = requestAnimationFrame(loop);
+  };
+
+  const stopCardScrollLoop = () => {
+    if (cardScrollRafRef.current != null) {
+      cancelAnimationFrame(cardScrollRafRef.current);
+      cardScrollRafRef.current = null;
+    }
+    cardPointerRef.current = null;
+  };
+
+  // ── Pointer-based card drag (so wheel-scroll and edge auto-scroll work) ──
+  const startCardPointerDrag = (e: ReactPointerEvent, colId: string, cardId: string) => {
+    if (e.button !== 0) return;
+    const downTarget = e.target as HTMLElement;
+    if (downTarget.closest("button, input, textarea, a")) return;
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const grabX = e.clientX - rect.left;
+    const grabY = e.clientY - rect.top;
+    const width = rect.width;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    dragCardIdRef.current = cardId;
+    let started = false;
+
+    const onMove = (ev: PointerEvent) => {
+      if (!started) {
+        if (Math.abs(ev.clientX - startX) < 5 && Math.abs(ev.clientY - startY) < 5) return;
+        started = true;
+        setDragCard({ cardId, fromColId: colId });
+        startCardScrollLoop();
+      }
+      cardPointerRef.current = { x: ev.clientX, y: ev.clientY };
+      setDragGhost({ x: ev.clientX - grabX, y: ev.clientY - grabY, width });
+      updateCardDropTarget(ev.clientX, ev.clientY, cardId);
+    };
+    const onWheel = (ev: WheelEvent) => {
+      if (!started) return;
+      const el = document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null;
+      const scroller = el?.closest<HTMLElement>(".cards");
+      if (scroller) {
+        ev.preventDefault();
+        scroller.scrollTop += ev.deltaY;
+      }
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("wheel", onWheel);
+      stopCardScrollLoop();
+      if (started) {
+        const dt = dropTargetRef.current;
+        if (dt) moveCard(cardId, colId, dt.colId, dt.beforeCardId);
+        setDragCard(null);
+        setDropTarget(null);
+        setDragGhost(null);
+        dropTargetRef.current = null;
+      } else {
+        const c = findCard(colId, cardId);
+        if (c) {
+          if (downTarget.closest(".card-cover-wrap")) setAdjustingCover({ colId, card: c });
+          else setEditingCard({ colId, card: c });
+        }
+      }
+      dragCardIdRef.current = null;
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("wheel", onWheel, { passive: false });
   };
 
   // ── Cross-board search ──
@@ -783,6 +1051,15 @@ export default function App() {
               <div className="archive-grid">
                 {archived.map((a) => (
                   <article className="archive-card" key={a.card.id}>
+                    {a.card.images.length > 0 && (
+                      <div className="card-cover-wrap">
+                        <NoteImage
+                          fileName={a.card.images[0]}
+                          className="card-cover"
+                          style={coverStyle(a.card)}
+                        />
+                      </div>
+                    )}
                     {a.card.label &&
                       (labels[a.card.label] ? (
                         <span
@@ -823,24 +1100,13 @@ export default function App() {
             {activeBoard.columns.map((col, colIndex) => (
             <section
               key={col.id}
+              data-col-id={col.id}
               className={
                 "column" +
                 (dropTarget?.colId === col.id ? " is-drop" : "") +
                 (colDrag?.from === colIndex ? " is-col-lift" : "")
               }
               style={columnStyle(colIndex)}
-              onDragOver={(e) => {
-                if (!dragCard) return;
-                e.preventDefault();
-                setDropTarget({ colId: col.id, beforeCardId: null });
-              }}
-              onDrop={(e) => {
-                if (!dragCard) return;
-                e.preventDefault();
-                const t = dropTarget ?? { colId: col.id, beforeCardId: null };
-                moveCard(dragCard.cardId, dragCard.fromColId, t.colId, t.beforeCardId);
-                clearDrag();
-              }}
             >
               <div
                 className="column-head"
@@ -900,45 +1166,14 @@ export default function App() {
                       dropTarget?.beforeCardId === card.id && <div className="drop-line" />}
                     <article
                       className={"card" + (dragCard?.cardId === card.id ? " is-dragging" : "")}
-                      draggable
-                      onClick={() => setEditingCard({ colId: col.id, card })}
+                      data-card-id={card.id}
+                      onPointerDown={(e) => startCardPointerDrag(e, col.id, card.id)}
                       onContextMenu={(e) => {
                         e.preventDefault();
                         setCardMenu({ colId: col.id, card, x: e.clientX, y: e.clientY });
                       }}
-                      onDragStart={(e) => {
-                        e.dataTransfer.effectAllowed = "move";
-                        setDragCard({ cardId: card.id, fromColId: col.id });
-                      }}
-                      onDragEnd={clearDrag}
-                      onDragOver={(e) => {
-                        if (!dragCard) return;
-                        e.preventDefault();
-                        e.stopPropagation();
-                        setDropTarget({ colId: col.id, beforeCardId: card.id });
-                      }}
                     >
-                      {card.label &&
-                        (labels[card.label] ? (
-                          <span
-                            className="card-chip"
-                            style={{
-                              background: LABEL_COLORS[card.label],
-                              color: LABEL_TEXT[card.label],
-                            }}
-                          >
-                            {labels[card.label]}
-                          </span>
-                        ) : (
-                          <div
-                            className="card-label"
-                            style={{ background: LABEL_COLORS[card.label] }}
-                          />
-                        ))}
-                      <div className="card-title">{card.title || "Untitled note"}</div>
-                      {cardView === "details" && card.body && (
-                        <div className="card-body">{card.body}</div>
-                      )}
+                      <CardContent card={card} labels={labels} cardView={cardView} />
                     </article>
                   </div>
                 ))}
@@ -977,6 +1212,22 @@ export default function App() {
           </a>
         </div>
       </footer>
+
+      {dragGhost &&
+        dragCard &&
+        (() => {
+          const gc = findCard(dragCard.fromColId, dragCard.cardId);
+          return gc ? (
+            <div
+              className="card-ghost"
+              style={{ left: dragGhost.x, top: dragGhost.y, width: dragGhost.width }}
+            >
+              <div className="card">
+                <CardContent card={gc} labels={labels} cardView={cardView} />
+              </div>
+            </div>
+          ) : null;
+        })()}
 
       {cardMenu && (
         <>
@@ -1065,6 +1316,25 @@ export default function App() {
         />
       )}
 
+      {adjustingCover && adjustingCover.card.images.length > 0 && (
+        <CoverAdjuster
+          fileName={adjustingCover.card.images[0]}
+          initialX={adjustingCover.card.coverX}
+          initialY={adjustingCover.card.coverY}
+          initialZoom={adjustingCover.card.coverZoom}
+          onSave={(x, y, zoom) => {
+            saveCard(adjustingCover.colId, {
+              ...adjustingCover.card,
+              coverX: x,
+              coverY: y,
+              coverZoom: zoom,
+            });
+            setAdjustingCover(null);
+          }}
+          onClose={() => setAdjustingCover(null)}
+        />
+      )}
+
       {confirmState && (
         <ConfirmDialog
           message={confirmState.message}
@@ -1114,6 +1384,104 @@ function ConfirmDialog({
           <button className="btn btn-danger" autoFocus onClick={onConfirm}>
             {okLabel}
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Cover image position adjuster: drag the image to set its focal point ──
+function CoverAdjuster({
+  fileName,
+  initialX,
+  initialY,
+  initialZoom,
+  onSave,
+  onClose,
+}: {
+  fileName: string;
+  initialX: number;
+  initialY: number;
+  initialZoom: number;
+  onSave: (x: number, y: number, zoom: number) => void;
+  onClose: () => void;
+}) {
+  const [x, setX] = useState(initialX);
+  const [y, setY] = useState(initialY);
+  const [zoom, setZoom] = useState(initialZoom);
+  const frameRef = useRef<HTMLDivElement | null>(null);
+
+  const clamp = (v: number) => Math.max(0, Math.min(100, v));
+
+  const onPointerDown = (e: ReactPointerEvent) => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const rect = frame.getBoundingClientRect();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const baseX = x;
+    const baseY = y;
+    const move = (ev: PointerEvent) => {
+      const dx = ((ev.clientX - startX) / rect.width) * 100;
+      const dy = ((ev.clientY - startY) / rect.height) * 100;
+      setX(clamp(baseX - dx));
+      setY(clamp(baseY - dy));
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  // Scroll to zoom. Non-passive so we can stop the page from scrolling.
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      setZoom((z) => Math.max(1, Math.min(3, z - e.deltaY * 0.0015)));
+    };
+    frame.addEventListener("wheel", onWheel, { passive: false });
+    return () => frame.removeEventListener("wheel", onWheel);
+  }, []);
+
+  return (
+    <div
+      className="modal-overlay"
+      onClick={(e) => {
+        e.stopPropagation();
+        onClose();
+      }}
+    >
+      <div className="cover-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="cover-frame" ref={frameRef} onPointerDown={onPointerDown}>
+          <NoteImage
+            fileName={fileName}
+            className="cover-frame-img"
+            style={{
+              objectPosition: `${x}% ${y}%`,
+              transform: `scale(${zoom})`,
+              transformOrigin: `${x}% ${y}%`,
+            }}
+          />
+        </div>
+        <span className="modal-hint">Drag to reposition, scroll to zoom</span>
+        <div className="modal-actions">
+          <button
+            className="btn btn-ghost"
+            onClick={() => {
+              setX(50);
+              setY(50);
+              setZoom(1);
+            }}
+          >
+            Reset
+          </button>
+          <div className="spacer" />
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-accent" onClick={() => onSave(x, y, zoom)}>Save</button>
         </div>
       </div>
     </div>
@@ -1294,6 +1662,11 @@ function CardEditor({
   const [title, setTitle] = useState(card.title);
   const [body, setBody] = useState(card.body);
   const [label, setLabel] = useState(card.label);
+  const [images, setImages] = useState<string[]>(card.images);
+  const [coverX, setCoverX] = useState(card.coverX);
+  const [coverY, setCoverY] = useState(card.coverY);
+  const [coverZoom, setCoverZoom] = useState(card.coverZoom);
+  const [showCover, setShowCover] = useState(false);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1303,9 +1676,39 @@ function CardEditor({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  const handlePaste = async (e: ReactClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const wasEmpty = images.length === 0;
+    let added = false;
+    for (const item of Array.from(items)) {
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (!file) continue;
+        const fileName = `${uid()}.${extFromMime(item.type)}`;
+        try {
+          const b64 = await blobToBase64(file);
+          await invoke("save_image", { fileName, dataBase64: b64 });
+          setImages((prev) => [...prev, fileName]);
+          added = true;
+        } catch {
+          // ignore a failed paste
+        }
+      }
+    }
+    // First image on this note becomes the cover: let them frame it right away.
+    if (wasEmpty && added) setShowCover(true);
+  };
+
+  const removeImage = (fileName: string) => {
+    setImages((prev) => prev.filter((f) => f !== fileName));
+    invoke("delete_image", { fileName }).catch(() => {});
+  };
+
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} onPaste={handlePaste}>
         <input
           className="modal-title"
           autoFocus
@@ -1317,9 +1720,36 @@ function CardEditor({
           className="modal-body"
           placeholder="Details (optional)"
           value={body}
-          rows={12}
+          rows={images.length > 0 ? 6 : 12}
           onChange={(e) => setBody(e.target.value)}
         />
+        {images.length > 0 && (
+          <>
+            <div className="modal-images">
+              {images.map((fileName) => (
+                <div className="modal-image" key={fileName}>
+                  <NoteImage fileName={fileName} className="modal-image-img" />
+                  <button
+                    type="button"
+                    className="modal-image-remove"
+                    title="Remove image"
+                    onClick={() => removeImage(fileName)}
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+            <button
+              type="button"
+              className="composer-details-toggle"
+              onClick={() => setShowCover(true)}
+            >
+              Adjust card thumbnail
+            </button>
+          </>
+        )}
+        <span className="modal-hint">Paste an image (Ctrl+V) to attach it</span>
         <div className="modal-field-row">
           <span className="label-caption">Label</span>
           <LabelDropdown
@@ -1337,12 +1767,38 @@ function CardEditor({
           <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
           <button
             className="btn btn-accent"
-            onClick={() => onSave({ ...card, title: title.trim(), body: body.trim(), label })}
+            onClick={() =>
+              onSave({
+                ...card,
+                title: title.trim(),
+                body: body.trim(),
+                label,
+                images,
+                coverX,
+                coverY,
+                coverZoom,
+              })
+            }
           >
             Save
           </button>
         </div>
       </div>
+      {showCover && images.length > 0 && (
+        <CoverAdjuster
+          fileName={images[0]}
+          initialX={coverX}
+          initialY={coverY}
+          initialZoom={coverZoom}
+          onSave={(x, y, zoom) => {
+            setCoverX(x);
+            setCoverY(y);
+            setCoverZoom(zoom);
+            setShowCover(false);
+          }}
+          onClose={() => setShowCover(false)}
+        />
+      )}
     </div>
   );
 }

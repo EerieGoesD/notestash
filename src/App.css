@@ -444,9 +444,21 @@ body {
   cursor: pointer;
   transition: border-color 0.12s, transform 0.06s;
 }
+.card { touch-action: none; }
 .card:hover { border-color: #34343c; }
-.card:active { transform: scale(0.99); }
-.card.is-dragging { opacity: 0.4; border-style: dashed; }
+.card.is-dragging { opacity: 0.35; }
+.card-ghost {
+  position: fixed;
+  z-index: 200;
+  pointer-events: none;
+  transform: rotate(2.5deg);
+}
+.card-ghost .card {
+  margin: 0;
+  cursor: grabbing;
+  box-shadow: 0 16px 38px rgba(0, 0, 0, 0.55);
+  border-color: var(--accent);
+}
 .card-label {
   height: 5px;
   border-radius: 3px;
@@ -626,6 +638,99 @@ body {
 .modal-body::placeholder { color: var(--text-dim); }
 .modal-actions { display: flex; align-items: center; gap: 8px; }
 .modal-actions .spacer { flex: 1; }
+
+/* ── Note images ── */
+.card-cover-wrap {
+  display: block;
+  width: 100%;
+  height: 150px;
+  overflow: hidden;
+  border-radius: 6px;
+  margin-bottom: 8px;
+}
+.card-cover-wrap.clickable { cursor: pointer; }
+.card-cover {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.note-image-loading {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  min-height: 40px;
+}
+.modal-hint { font-size: 11px; color: var(--text-dim); }
+.modal-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.modal-image {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg);
+}
+.modal-image-img {
+  display: block;
+  max-width: 170px;
+  max-height: 170px;
+  object-fit: contain;
+}
+.modal-image-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.modal-image:hover .modal-image-remove { opacity: 1; }
+
+/* ── Cover position adjuster ── */
+.cover-modal {
+  width: 380px;
+  max-width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.cover-frame {
+  width: 100%;
+  aspect-ratio: 256 / 150;
+  border-radius: 8px;
+  overflow: hidden;
+  cursor: grab;
+  background: var(--bg);
+  touch-action: none;
+  user-select: none;
+}
+.cover-frame:active { cursor: grabbing; }
+.cover-frame-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  pointer-events: none;
+}
 
 /* ── Label picker (shared by the editor and the right-click menu) ── */
 .modal-field { display: flex; flex-direction: column; gap: 7px; }
