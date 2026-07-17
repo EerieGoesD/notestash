@@ -8,6 +8,7 @@ A fast, private note board for your PC. Capture quick notes and organize them in
 - **Quick capture** - jot a note in one line, with optional details you can add when you want them.
 - **Drag and drop** - move notes between columns and reorder columns with a smooth drag, or nudge them with a click.
 - **Color labels** - tag notes with colored labels you can name yourself.
+- **Images** - paste an image into a note, choose which one is the card's thumbnail, reposition, zoom, and rotate it, and optionally compress each image to save space.
 - **Search everything** - find any note by title or details across all of your boards in a second.
 - **Archive** - send notes to a bin and restore them later, or delete them for good.
 - **Themes** - light and dark, plus a titles-only or titles-plus-details view.
