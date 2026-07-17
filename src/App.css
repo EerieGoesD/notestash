@@ -163,6 +163,7 @@ body {
 }
 .view-select:hover { border-color: var(--accent); }
 .view-select:focus { border-color: var(--accent); }
+.context-view-select { width: 100%; box-sizing: border-box; }
 .theme-toggle {
   padding: 7px 11px;
   font-size: 14px;
@@ -238,6 +239,12 @@ body {
   border-top: 1px solid var(--border);
 }
 .board-icon { font-size: 14px; line-height: 1; flex-shrink: 0; }
+.board-item.danger-entry .board-name { color: var(--danger); }
+.board-item.danger-entry:hover { background: rgba(239, 68, 68, 0.12); }
+.board-item.danger-entry.active {
+  background: rgba(239, 68, 68, 0.16);
+}
+.board-item.danger-entry.active .board-name { color: var(--danger-h); }
 .board-item {
   display: flex;
   align-items: center;
@@ -342,6 +349,44 @@ body {
   margin-top: 12px;
 }
 .archive-card-actions .btn { padding: 5px 12px; font-size: 12.5px; }
+
+/* ── Danger Zone view ── */
+.danger-view {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px 24px 24px;
+}
+.danger-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 640px;
+}
+.danger-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+.danger-option-text h3 {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.danger-option-text p {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+.danger-option .btn { flex-shrink: 0; }
 
 /* ── Column ── */
 .column {
@@ -661,6 +706,15 @@ body {
   border-radius: 6px;
   min-height: 40px;
 }
+.adjust-cover-btn {
+  align-self: flex-start;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.adjust-cover-btn span { font-size: 14px; line-height: 1; }
 .modal-hint { font-size: 11px; color: var(--text-dim); }
 .modal-images {
   display: flex;
@@ -669,10 +723,78 @@ body {
 }
 .modal-image {
   position: relative;
-  border: 1px solid var(--border);
+  border: 2px solid var(--border);
   border-radius: 8px;
   overflow: hidden;
   background: var(--bg);
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.modal-image.is-cover {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.cover-badge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 2;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  pointer-events: none;
+}
+.set-cover-hint {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 4px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 0.12s;
+  pointer-events: none;
+}
+.modal-image:not(.is-cover):hover .set-cover-hint { opacity: 1; }
+.modal-image-sizes {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 1;
+  background: rgba(0, 0, 0, 0.66);
+  color: #fff;
+  font-size: 10px;
+  line-height: 1.35;
+  padding: 4px 7px;
+  pointer-events: none;
+}
+.modal-image-sizes span { display: block; }
+.img-compress {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  margin-bottom: 3px;
+  pointer-events: auto; /* the overlay is click-through; the control is not */
+}
+.img-compress input {
+  width: 12px;
+  height: 12px;
+  cursor: pointer;
+  accent-color: var(--accent);
 }
 .modal-image-img {
   display: block;
@@ -684,6 +806,7 @@ body {
   position: absolute;
   top: 4px;
   right: 4px;
+  z-index: 3;
   width: 22px;
   height: 22px;
   border: none;
@@ -695,10 +818,32 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  opacity: 0;
+  opacity: 0.85;
   transition: opacity 0.12s;
 }
-.modal-image:hover .modal-image-remove { opacity: 1; }
+.modal-image-remove:hover { opacity: 1; }
+.img-rotate {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 3px;
+  pointer-events: auto; /* the overlay is click-through; the buttons are not */
+}
+.img-rotate button {
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s;
+}
+.img-rotate button:hover { background: rgba(255, 255, 255, 0.3); }
 
 /* ── Cover position adjuster ── */
 .cover-modal {
@@ -851,6 +996,12 @@ body {
   letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--text-dim);
+}
+.context-menu-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: -3px;
+  line-height: 1.3;
 }
 .context-menu-open {
   background: var(--surface2);

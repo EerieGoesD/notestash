@@ -19,7 +19,9 @@ type Card = {
   title: string;
   body: string;
   label: string;
-  images: string[];
+  images: string[]; // images[0] is the card thumbnail (cover)
+  imageMeta?: Record<string, { orig: number; size: number }>; // per-image byte sizes
+  view?: "details" | "titles"; // per-note override of the global titles/details view
   coverX: number; // cover image focal point, 0-100 (object-position)
   coverY: number;
   coverZoom: number; // cover image scale, 1 = fit
@@ -86,6 +88,60 @@ function blobToBase64(blob: Blob): Promise<string> {
     reader.readAsDataURL(blob);
   });
 }
+function fmtBytes(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+// Downscale + re-encode an image to a smaller JPEG (for the "compress" option).
+async function compressImage(file: Blob, maxDim = 1600, quality = 0.8): Promise<Blob> {
+  const bitmap = await createImageBitmap(file);
+  let width = bitmap.width;
+  let height = bitmap.height;
+  const longest = Math.max(width, height);
+  if (longest > maxDim) {
+    const scale = maxDim / longest;
+    width = Math.round(width * scale);
+    height = Math.round(height * scale);
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    bitmap.close();
+    return file;
+  }
+  ctx.fillStyle = "#ffffff"; // flatten any transparency (JPEG has none)
+  ctx.fillRect(0, 0, width, height);
+  ctx.drawImage(bitmap, 0, 0, width, height);
+  bitmap.close();
+  return new Promise<Blob>((resolve) => {
+    canvas.toBlob((b) => resolve(b ?? file), "image/jpeg", quality);
+  });
+}
+// Rotate an image blob by +90 or -90 degrees, keeping a lossless format where possible.
+async function rotateBlob(file: Blob, degrees: 90 | -90, mime: string): Promise<Blob> {
+  const bitmap = await createImageBitmap(file);
+  const w = bitmap.width;
+  const h = bitmap.height;
+  const canvas = document.createElement("canvas");
+  canvas.width = h; // a quarter turn swaps width and height
+  canvas.height = w;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    bitmap.close();
+    return file;
+  }
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate((degrees * Math.PI) / 180);
+  ctx.drawImage(bitmap, -w / 2, -h / 2);
+  bitmap.close();
+  const outMime = mime === "image/jpeg" ? "image/jpeg" : "image/png";
+  return new Promise<Blob>((resolve) => {
+    canvas.toBlob((b) => resolve(b ?? file), outMime, outMime === "image/jpeg" ? 0.92 : undefined);
+  });
+}
 // Cache loaded image data URLs by file name so cards don't re-read from disk.
 const imageUrlCache = new Map<string, string>();
 
@@ -142,6 +198,8 @@ function CardContent({
   labels: Record<string, string>;
   cardView: CardView;
 }) {
+  // A note can override the global titles/details setting for itself.
+  const view = card.view ?? cardView;
   return (
     <>
       {card.images.length > 0 && (
@@ -161,7 +219,7 @@ function CardContent({
           <div className="card-label" style={{ background: LABEL_COLORS[card.label] }} />
         ))}
       <div className="card-title">{card.title || "Untitled note"}</div>
-      {cardView === "details" && card.body && <div className="card-body">{card.body}</div>}
+      {view === "details" && card.body && <div className="card-body">{card.body}</div>}
     </>
   );
 }
@@ -221,6 +279,19 @@ function makeDefaultWorkspace(): Workspace {
   return { version: 2, boards: [b], activeBoardId: b.id, labels: makeDefaultLabels(), archived: [] };
 }
 
+function normalizeImageMeta(raw: any): Record<string, { orig: number; size: number }> {
+  const out: Record<string, { orig: number; size: number }> = {};
+  if (raw && typeof raw === "object") {
+    for (const k of Object.keys(raw)) {
+      const v = raw[k];
+      if (v && typeof v.orig === "number" && typeof v.size === "number") {
+        out[k] = { orig: v.orig, size: v.size };
+      }
+    }
+  }
+  return out;
+}
+
 // ── Defensive coercion (handles old single-board / unlabeled saves too) ──
 function normalizeCard(raw: any): Card {
   return {
@@ -229,6 +300,8 @@ function normalizeCard(raw: any): Card {
     body: typeof raw?.body === "string" ? raw.body : "",
     label: typeof raw?.label === "string" && raw.label in LABEL_COLORS ? raw.label : "",
     images: Array.isArray(raw?.images) ? raw.images.filter((s: any) => typeof s === "string") : [],
+    imageMeta: normalizeImageMeta(raw?.imageMeta),
+    view: raw?.view === "details" || raw?.view === "titles" ? raw.view : undefined,
     coverX: typeof raw?.coverX === "number" ? raw.coverX : 50,
     coverY: typeof raw?.coverY === "number" ? raw.coverY : 50,
     coverZoom: typeof raw?.coverZoom === "number" && raw.coverZoom >= 1 ? raw.coverZoom : 1,
@@ -311,7 +384,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(
     () => localStorage.getItem("notestash.sidebar") !== "closed"
   );
-  const [showArchive, setShowArchive] = useState(false);
+  const [view, setView] = useState<"board" | "archive" | "danger">("board");
   const [query, setQuery] = useState("");
   const [editingBoardId, setEditingBoardId] = useState<string | null>(null);
   const [editingCard, setEditingCard] = useState<{ colId: string; card: Card } | null>(null);
@@ -407,7 +480,7 @@ export default function App() {
     const b = makeNewBoard("New Board");
     setWorkspace((ws) => ({ ...ws, boards: [...ws.boards, b], activeBoardId: b.id }));
     setEditingBoardId(b.id);
-    setShowArchive(false);
+    setView("board");
   };
 
   const renameBoard = (id: string, title: string) =>
@@ -438,7 +511,7 @@ export default function App() {
 
   const selectBoard = (id: string) => {
     setWorkspace((ws) => ({ ...ws, activeBoardId: id }));
-    setShowArchive(false);
+    setView("board");
   };
 
   // ── Column operations (on the active board) ──
@@ -629,6 +702,9 @@ export default function App() {
   const setCardLabel = (colId: string, card: Card, color: string) =>
     saveCard(colId, { ...card, label: color });
 
+  const setCardNoteView = (colId: string, card: Card, view: CardView) =>
+    saveCard(colId, { ...card, view });
+
   const deleteCard = (colId: string, cardId: string) => {
     const card = activeBoard.columns.find((c) => c.id === colId)?.cards.find((cd) => cd.id === cardId);
     card?.images.forEach((f) => invoke("delete_image", { fileName: f }).catch(() => {}));
@@ -682,6 +758,63 @@ export default function App() {
     setWorkspace((ws) => ({ ...ws, archived: ws.archived.filter((a) => a.card.id !== cardId) }));
   };
 
+  // ── Danger Zone ──
+  const allImageNames = (): string[] => {
+    const names: string[] = [];
+    for (const b of workspace.boards)
+      for (const c of b.columns) for (const cd of c.cards) names.push(...cd.images);
+    for (const a of workspace.archived) names.push(...a.card.images);
+    return names;
+  };
+
+  const deleteAllImages = async () => {
+    const n = allImageNames().length;
+    if (n === 0) {
+      flash("No images to delete");
+      return;
+    }
+    if (
+      !(await confirmDelete(
+        `Delete all ${n} image${n === 1 ? "" : "s"} from every note on every board? The notes themselves stay. This can't be undone.`,
+        "Delete images"
+      ))
+    )
+      return;
+    allImageNames().forEach((f) => invoke("delete_image", { fileName: f }).catch(() => {}));
+    imageUrlCache.clear();
+    const stripImages = (cd: Card): Card => ({
+      ...cd,
+      images: [],
+      coverX: 50,
+      coverY: 50,
+      coverZoom: 1,
+    });
+    setWorkspace((ws) => ({
+      ...ws,
+      boards: ws.boards.map((b) => ({
+        ...b,
+        columns: b.columns.map((c) => ({ ...c, cards: c.cards.map(stripImages) })),
+      })),
+      archived: ws.archived.map((a) => ({ ...a, card: stripImages(a.card) })),
+    }));
+    flash("All images deleted");
+  };
+
+  const deleteEverything = async () => {
+    if (
+      !(await confirmDelete(
+        "Reset NoteStash and delete EVERYTHING - all boards, columns, notes, labels, and images? This cannot be undone.",
+        "Delete everything"
+      ))
+    )
+      return;
+    allImageNames().forEach((f) => invoke("delete_image", { fileName: f }).catch(() => {}));
+    imageUrlCache.clear();
+    setWorkspace(makeDefaultWorkspace());
+    setView("board");
+    flash("Everything reset");
+  };
+
   const moveCard = (
     cardId: string,
     fromColId: string,
@@ -707,6 +840,43 @@ export default function App() {
   const findCard = (colId: string, cardId: string): Card | null =>
     activeBoard.columns.find((c) => c.id === colId)?.cards.find((cd) => cd.id === cardId) ?? null;
 
+  // Duplicate a note right below the original: title, body, label, cover framing,
+  // and its images (each image is copied to a new file so the two are independent).
+  const duplicateCard = async (colId: string, card: Card) => {
+    const newImages: string[] = [];
+    const newMeta: Record<string, { orig: number; size: number }> = {};
+    for (const fileName of card.images) {
+      const ext = fileName.split(".").pop() || "png";
+      const newName = `${uid()}.${ext}`;
+      try {
+        const b64 = await invoke<string>("load_image", { fileName });
+        await invoke("save_image", { fileName: newName, dataBase64: b64 });
+        newImages.push(newName);
+        const m = card.imageMeta?.[fileName];
+        if (m) newMeta[newName] = { ...m };
+      } catch {
+        // skip an image that fails to copy
+      }
+    }
+    const copy: Card = {
+      ...card,
+      id: uid(),
+      images: newImages,
+      imageMeta: newMeta,
+      createdAt: Date.now(),
+    };
+    updateActiveBoard((b) => ({
+      ...b,
+      columns: b.columns.map((c) => {
+        if (c.id !== colId) return c;
+        const idx = c.cards.findIndex((cd) => cd.id === card.id);
+        const cards = [...c.cards];
+        cards.splice(idx < 0 ? cards.length : idx + 1, 0, copy);
+        return { ...c, cards };
+      }),
+    }));
+  };
+
   // Scroll a cards column when the drag pointer nears its top/bottom edge.
   const autoScrollCards = (scroller: HTMLElement, clientY: number) => {
     const r = scroller.getBoundingClientRect();
@@ -723,9 +893,20 @@ export default function App() {
 
   // Figure out which column and insertion point the pointer is over, from the DOM.
   const updateCardDropTarget = (x: number, y: number, draggedId: string) => {
-    const el = document.elementFromPoint(x, y) as HTMLElement | null;
-    const colSection = el?.closest<HTMLElement>(".column");
-    if (!colSection) return;
+    const board = boardRef.current;
+    if (!board) return;
+    // Pick the target column by horizontal position, so a short/empty column is
+    // droppable anywhere in its width even when the pointer is below its body.
+    const columns = Array.from(board.querySelectorAll<HTMLElement>(".column"));
+    let colSection: HTMLElement | null = null;
+    for (const c of columns) {
+      const r = c.getBoundingClientRect();
+      if (x >= r.left && x <= r.right) {
+        colSection = c;
+        break;
+      }
+    }
+    if (!colSection) return; // pointer is in a gap between columns; keep last target
     const colId = colSection.getAttribute("data-col-id");
     if (!colId) return;
     const cardsEl = colSection.querySelector<HTMLElement>(".cards");
@@ -977,7 +1158,8 @@ export default function App() {
               <div
                 key={b.id}
                 className={
-                  "board-item" + (!showArchive && b.id === workspace.activeBoardId ? " active" : "")
+                  "board-item" +
+                  (view === "board" && b.id === workspace.activeBoardId ? " active" : "")
                 }
                 onClick={() => selectBoard(b.id)}
               >
@@ -1027,17 +1209,24 @@ export default function App() {
 
           <div className="sidebar-bottom">
             <div
-              className={"board-item" + (showArchive ? " active" : "")}
-              onClick={() => setShowArchive(true)}
+              className={"board-item" + (view === "archive" ? " active" : "")}
+              onClick={() => setView("archive")}
             >
               <span className="board-icon">🗑</span>
               <span className="board-name">Archive</span>
               {archived.length > 0 && <span className="count">{archived.length}</span>}
             </div>
+            <div
+              className={"board-item danger-entry" + (view === "danger" ? " active" : "")}
+              onClick={() => setView("danger")}
+            >
+              <span className="board-icon">⚠</span>
+              <span className="board-name">Danger Zone</span>
+            </div>
           </div>
         </aside>
 
-        {showArchive ? (
+        {view === "archive" ? (
           <main className="archive-view">
             <div className="archive-head">
               <h2>Archived notes</h2>
@@ -1094,6 +1283,41 @@ export default function App() {
                 ))}
               </div>
             )}
+          </main>
+        ) : view === "danger" ? (
+          <main className="danger-view">
+            <div className="archive-head">
+              <h2>Danger Zone</h2>
+              <span className="archive-sub">
+                Irreversible actions. Export a backup first if you are unsure.
+              </span>
+            </div>
+            <div className="danger-list">
+              <div className="danger-option">
+                <div className="danger-option-text">
+                  <h3>Delete all images</h3>
+                  <p>
+                    Removes every image from every note on every board, and from the archive. The
+                    notes themselves stay. This cannot be undone.
+                  </p>
+                </div>
+                <button className="btn btn-danger" onClick={deleteAllImages}>
+                  Delete all images
+                </button>
+              </div>
+              <div className="danger-option">
+                <div className="danger-option-text">
+                  <h3>Delete everything</h3>
+                  <p>
+                    Resets NoteStash to a clean slate: all boards, columns, notes, labels, and
+                    images are erased. This cannot be undone.
+                  </p>
+                </div>
+                <button className="btn btn-danger" onClick={deleteEverything}>
+                  Delete everything
+                </button>
+              </div>
+            </div>
           </main>
         ) : (
           <main className="board" ref={boardRef} onMouseDown={onPanStart}>
@@ -1243,7 +1467,7 @@ export default function App() {
             className="context-menu"
             style={{
               left: Math.max(8, Math.min(cardMenu.x, window.innerWidth - 258)),
-              top: Math.max(8, Math.min(cardMenu.y, window.innerHeight - 330)),
+              top: Math.max(8, Math.min(cardMenu.y, window.innerHeight - 476)),
             }}
             onMouseDown={(e) => e.stopPropagation()}
           >
@@ -1257,6 +1481,20 @@ export default function App() {
               }}
               onRename={renameLabel}
             />
+            <div className="context-menu-title">Show this note</div>
+            <select
+              className="view-select context-view-select"
+              value={cardMenu.card.view ?? cardView}
+              onChange={(e) => {
+                setCardNoteView(cardMenu.colId, cardMenu.card, e.target.value as CardView);
+                setCardMenu(null);
+              }}
+              title="How much of this note to show"
+            >
+              <option value="details">Show title + detail</option>
+              <option value="titles">Show title only</option>
+            </select>
+            <span className="context-menu-hint">Only this note, not the whole board</span>
             <button
               className="context-menu-open"
               onClick={() => {
@@ -1264,7 +1502,16 @@ export default function App() {
                 setCardMenu(null);
               }}
             >
-              Open note
+              Open Note
+            </button>
+            <button
+              className="context-menu-open"
+              onClick={() => {
+                duplicateCard(cardMenu.colId, cardMenu.card);
+                setCardMenu(null);
+              }}
+            >
+              Duplicate Note
             </button>
             <button
               className="context-menu-open"
@@ -1273,7 +1520,7 @@ export default function App() {
                 setCardMenu(null);
               }}
             >
-              Archive note
+              Archive Note
             </button>
             <button
               className="context-menu-delete"
@@ -1286,7 +1533,7 @@ export default function App() {
                 }
               }}
             >
-              Delete note
+              Delete Note
             </button>
           </div>
         </>
@@ -1663,10 +1910,24 @@ function CardEditor({
   const [body, setBody] = useState(card.body);
   const [label, setLabel] = useState(card.label);
   const [images, setImages] = useState<string[]>(card.images);
+  const [imageMeta, setImageMeta] = useState<Record<string, { orig: number; size: number }>>(
+    card.imageMeta ?? {}
+  );
   const [coverX, setCoverX] = useState(card.coverX);
   const [coverY, setCoverY] = useState(card.coverY);
   const [coverZoom, setCoverZoom] = useState(card.coverZoom);
   const [showCover, setShowCover] = useState(false);
+  // Images pasted in THIS session (not yet saved). We keep each one's original
+  // blob so its per-image "Compress" box can be ticked/unticked freely; the
+  // compression is only committed to disk when the card is saved. Once a card is
+  // saved and reopened, its images are no longer in here, so the box is gone.
+  const sessionImages = useRef<
+    Map<string, { origBlob: Blob; origSize: number; compressed?: { blob: Blob; size: number } }>
+  >(new Map());
+  const [compressPick, setCompressPick] = useState<Record<string, boolean>>({});
+  // Pre-rotation files, deleted from disk only when the card is saved (so Cancel
+  // keeps the note's original images intact).
+  const replacedOnSave = useRef<string[]>([]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1690,7 +1951,12 @@ function CardEditor({
         try {
           const b64 = await blobToBase64(file);
           await invoke("save_image", { fileName, dataBase64: b64 });
+          sessionImages.current.set(fileName, { origBlob: file, origSize: file.size });
           setImages((prev) => [...prev, fileName]);
+          setImageMeta((prev) => ({
+            ...prev,
+            [fileName]: { orig: file.size, size: file.size },
+          }));
           added = true;
         } catch {
           // ignore a failed paste
@@ -1703,7 +1969,94 @@ function CardEditor({
 
   const removeImage = (fileName: string) => {
     setImages((prev) => prev.filter((f) => f !== fileName));
+    setImageMeta((prev) => {
+      const next = { ...prev };
+      delete next[fileName];
+      return next;
+    });
+    sessionImages.current.delete(fileName);
+    setCompressPick((prev) => {
+      const next = { ...prev };
+      delete next[fileName];
+      return next;
+    });
     invoke("delete_image", { fileName }).catch(() => {});
+  };
+
+  // Make an image the card thumbnail by moving it to the front (images[0] = cover).
+  const setAsCover = (fileName: string) => {
+    setImages((prev) =>
+      prev[0] === fileName ? prev : [fileName, ...prev.filter((f) => f !== fileName)]
+    );
+  };
+
+  // Rotate an image a quarter turn. The rotated version becomes a new file; the
+  // old one is removed on save (see replacedOnSave), so a Cancel is safe.
+  const rotateEditorImage = async (fileName: string, degrees: 90 | -90) => {
+    const ext = fileName.split(".").pop()?.toLowerCase() || "png";
+    const mime = mimeFromName(fileName);
+    try {
+      const sess = sessionImages.current.get(fileName);
+      let srcBlob: Blob;
+      if (sess) {
+        srcBlob = sess.origBlob;
+      } else {
+        const b64 = await invoke<string>("load_image", { fileName });
+        srcBlob = await (await fetch(`data:${mime};base64,${b64}`)).blob();
+      }
+      const rotated = await rotateBlob(srcBlob, degrees, mime);
+      const newName = `${uid()}.${ext}`;
+      await invoke("save_image", { fileName: newName, dataBase64: await blobToBase64(rotated) });
+      replacedOnSave.current.push(fileName);
+      setImages((prev) => prev.map((f) => (f === fileName ? newName : f)));
+      setImageMeta((prev) => {
+        const next = { ...prev };
+        delete next[fileName];
+        next[newName] = { orig: rotated.size, size: rotated.size };
+        return next;
+      });
+      if (sess) {
+        sessionImages.current.delete(fileName);
+        sessionImages.current.set(newName, { origBlob: rotated, origSize: rotated.size });
+        const wasPicked = !!compressPick[fileName];
+        setCompressPick((prev) => {
+          const next = { ...prev };
+          delete next[fileName];
+          if (wasPicked) next[newName] = true;
+          return next;
+        });
+        // If Compress was ticked for this image, recompute it for the rotated one.
+        if (wasPicked) {
+          try {
+            const c = await compressImage(rotated);
+            const s = sessionImages.current.get(newName);
+            if (s && c.size < rotated.size) s.compressed = { blob: c, size: c.size };
+            setCompressPick((prev) => ({ ...prev }));
+          } catch {
+            // leave it uncompressed if it fails
+          }
+        }
+      }
+    } catch {
+      // ignore a failed rotation
+    }
+  };
+
+  // Tick/untick a single image's "Compress" box. On the first tick we compute
+  // (and cache) the compressed version so the thumbnail can show the saving.
+  // Nothing is written to disk here - it's committed when the card is saved.
+  const toggleImageCompress = async (fileName: string, checked: boolean) => {
+    setCompressPick((prev) => ({ ...prev, [fileName]: checked }));
+    if (!checked) return;
+    const sess = sessionImages.current.get(fileName);
+    if (!sess || sess.compressed) return;
+    try {
+      const c = await compressImage(sess.origBlob);
+      sess.compressed = { blob: c, size: c.size };
+      setCompressPick((prev) => ({ ...prev })); // re-render to show the projected size
+    } catch {
+      // leave it as original if compression fails
+    }
   };
 
   return (
@@ -1726,30 +2079,101 @@ function CardEditor({
         {images.length > 0 && (
           <>
             <div className="modal-images">
-              {images.map((fileName) => (
-                <div className="modal-image" key={fileName}>
-                  <NoteImage fileName={fileName} className="modal-image-img" />
-                  <button
-                    type="button"
-                    className="modal-image-remove"
-                    title="Remove image"
-                    onClick={() => removeImage(fileName)}
+              {images.map((fileName) => {
+                const meta = imageMeta[fileName];
+                const isCover = fileName === images[0];
+                const sess = sessionImages.current.get(fileName);
+                const picked = !!compressPick[fileName];
+                // Original size: from the fresh blob, or from saved meta.
+                const origBytes = sess ? sess.origSize : meta ? meta.orig : null;
+                // Compressed size: projected (this session) or already saved.
+                const compBytes = sess
+                  ? picked && sess.compressed && sess.compressed.size < sess.origSize
+                    ? sess.compressed.size
+                    : null
+                  : meta && meta.size < meta.orig
+                    ? meta.size
+                    : null;
+                return (
+                  <div
+                    className={"modal-image" + (isCover ? " is-cover" : "")}
+                    key={fileName}
+                    onClick={() => setAsCover(fileName)}
+                    title={
+                      isCover
+                        ? "This is the card thumbnail"
+                        : "Click to use as the card thumbnail"
+                    }
                   >
-                    ✕
-                  </button>
-                </div>
-              ))}
+                    <NoteImage fileName={fileName} className="modal-image-img" />
+                    {isCover && <span className="cover-badge">Card thumbnail</span>}
+                    {!isCover && <span className="set-cover-hint">Set as thumbnail</span>}
+                    <button
+                      type="button"
+                      className="modal-image-remove"
+                      title="Remove image"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        removeImage(fileName);
+                      }}
+                    >
+                      ✕
+                    </button>
+                    <div className="modal-image-sizes">
+                      {sess && (
+                        <label
+                          className="img-compress"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={picked}
+                            onChange={(e) => toggleImageCompress(fileName, e.target.checked)}
+                          />
+                          Compress
+                        </label>
+                      )}
+                      <div className="img-rotate">
+                        <button
+                          type="button"
+                          title="Rotate left"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            rotateEditorImage(fileName, -90);
+                          }}
+                        >
+                          ↺
+                        </button>
+                        <button
+                          type="button"
+                          title="Rotate right"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            rotateEditorImage(fileName, 90);
+                          }}
+                        >
+                          ↻
+                        </button>
+                      </div>
+                      {origBytes != null && <span>Original: {fmtBytes(origBytes)}</span>}
+                      {compBytes != null && <span>Compressed: {fmtBytes(compBytes)}</span>}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
             <button
               type="button"
-              className="composer-details-toggle"
+              className="btn btn-ghost adjust-cover-btn"
               onClick={() => setShowCover(true)}
             >
-              Adjust card thumbnail
+              <span aria-hidden="true">◱</span> Adjust card thumbnail
             </button>
           </>
         )}
-        <span className="modal-hint">Paste an image (Ctrl+V) to attach it</span>
+        {images.length === 0 && (
+          <span className="modal-hint">Paste an image (Ctrl+V) to attach it</span>
+        )}
         <div className="modal-field-row">
           <span className="label-caption">Label</span>
           <LabelDropdown
@@ -1767,18 +2191,49 @@ function CardEditor({
           <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
           <button
             className="btn btn-accent"
-            onClick={() =>
+            onClick={async () => {
+              // Commit compression for the images the user ticked, then save.
+              let finalImages = images;
+              const finalMeta = { ...imageMeta };
+              for (const fileName of images) {
+                const sess = sessionImages.current.get(fileName);
+                if (
+                  sess &&
+                  compressPick[fileName] &&
+                  sess.compressed &&
+                  sess.compressed.size < sess.origSize
+                ) {
+                  try {
+                    const newName = `${uid()}.jpg`;
+                    const newB64 = await blobToBase64(sess.compressed.blob);
+                    await invoke("save_image", { fileName: newName, dataBase64: newB64 });
+                    await invoke("delete_image", { fileName }).catch(() => {});
+                    imageUrlCache.delete(fileName);
+                    finalImages = finalImages.map((f) => (f === fileName ? newName : f));
+                    finalMeta[newName] = { orig: sess.origSize, size: sess.compressed.size };
+                    delete finalMeta[fileName];
+                  } catch {
+                    // keep the original on failure
+                  }
+                }
+              }
+              // Now that we're keeping the changes, drop the pre-rotation files.
+              replacedOnSave.current.forEach((f) =>
+                invoke("delete_image", { fileName: f }).catch(() => {})
+              );
+              replacedOnSave.current = [];
               onSave({
                 ...card,
                 title: title.trim(),
                 body: body.trim(),
                 label,
-                images,
+                images: finalImages,
+                imageMeta: finalMeta,
                 coverX,
                 coverY,
                 coverZoom,
-              })
-            }
+              });
+            }}
           >
             Save
           </button>
