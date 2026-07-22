@@ -481,6 +481,7 @@ body {
   flex-direction: column;
 }
 .card {
+  position: relative;
   background: var(--surface2);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -489,6 +490,28 @@ body {
   cursor: pointer;
   transition: border-color 0.12s, transform 0.06s;
 }
+.card-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.12s, background 0.12s;
+}
+.card:hover .card-copy { opacity: 1; }
+.card-copy:hover { background: rgba(0, 0, 0, 0.82); }
 .card { touch-action: none; }
 .card:hover { border-color: #34343c; }
 .card.is-dragging { opacity: 0.35; }
@@ -997,6 +1020,7 @@ body {
   text-transform: uppercase;
   color: var(--text-dim);
 }
+.copy-menu { width: 210px; }
 .context-menu-hint {
   font-size: 11px;
   color: var(--text-dim);

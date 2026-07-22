@@ -10,7 +10,22 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Split-Path -Parent $ScriptDir
-$ReleaseDir = Join-Path $Root "src-tauri\target\release"
+
+# The SDK tools we run (makeappx/makepri) are host tools - makepri has no ARM
+# build - so always look them up under x64, whatever we are packaging for.
+$ToolArch = "x64"
+
+# A cross-compiled build lands in target\<rust-target>\release, not target\release.
+$RustTarget = switch ($Architecture) {
+  "arm64" { "aarch64-pc-windows-msvc" }
+  "x86"   { "i686-pc-windows-msvc" }
+  default { "" }
+}
+$ReleaseDir = if ($RustTarget) {
+  Join-Path $Root "src-tauri\target\$RustTarget\release"
+} else {
+  Join-Path $Root "src-tauri\target\release"
+}
 $Template = Join-Path $Root "packaging\msix\AppxManifest.xml.template"
 $AssetsSrc = Join-Path $Root "packaging\msix\assets"
 $DistRoot = Join-Path $Root "msix-dist"
@@ -26,7 +41,7 @@ function Find-WindowsKitTool {
   }
   $versions = Get-ChildItem -LiteralPath $kitsRoot -Directory | Sort-Object Name -Descending
   foreach ($version in $versions) {
-    $candidate = Join-Path $version.FullName "$Architecture\$ToolName"
+    $candidate = Join-Path $version.FullName "$ToolArch\$ToolName"
     if (Test-Path $candidate) { return $candidate }
   }
   throw "$ToolName not found under $kitsRoot"
@@ -37,7 +52,10 @@ $ExeName = "notestash.exe"
 $ReleaseExe = Join-Path $ReleaseDir $ExeName
 if (-not (Test-Path $ReleaseExe)) {
   Push-Location $Root
-  try { npm run tauri build -- --no-bundle } finally { Pop-Location }
+  try {
+    if ($RustTarget) { npm run tauri build -- --no-bundle --target $RustTarget }
+    else { npm run tauri build -- --no-bundle }
+  } finally { Pop-Location }
 }
 if (-not (Test-Path $ReleaseExe)) {
   $exe = Get-ChildItem -LiteralPath $ReleaseDir -Filter *.exe -File |
@@ -60,6 +78,16 @@ $manifest = $manifest.Replace("{{VERSION}}", $Version)
 $manifest = $manifest.Replace("{{ARCHITECTURE}}", $Architecture)
 $manifest = $manifest.Replace("{{EXE_NAME}}", $ExeName)
 Set-Content -LiteralPath (Join-Path $LayoutDir "AppxManifest.xml") -Value $manifest -Encoding UTF8
+
+# The target-based "unplated" taskbar icons are qualified resource names, so the
+# package needs a resource index or Windows ignores them and plates the icon.
+$makePri = Find-WindowsKitTool "makepri.exe"
+$PriConfig = Join-Path $DistRoot "priconfig.xml"
+if (Test-Path $PriConfig) { Remove-Item -LiteralPath $PriConfig -Force }
+& $makePri createconfig /cf $PriConfig /dq en-US /o
+if ($LASTEXITCODE -ne 0) { throw "makepri createconfig failed with exit code $LASTEXITCODE" }
+& $makePri new /pr $LayoutDir /cf $PriConfig /of (Join-Path $LayoutDir "resources.pri") /o
+if ($LASTEXITCODE -ne 0) { throw "makepri new failed with exit code $LASTEXITCODE" }
 
 # Pack (unsigned; the Microsoft Store re-signs on submission).
 New-Item -ItemType Directory -Force -Path $DistRoot | Out-Null

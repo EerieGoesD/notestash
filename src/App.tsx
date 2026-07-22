@@ -381,6 +381,9 @@ export default function App() {
   const [theme, setTheme] = useState<"dark" | "light">(() =>
     localStorage.getItem("notestash.theme") === "light" ? "light" : "dark"
   );
+  // Card whose copy button was just used, so it can show a tick briefly.
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [copyMenu, setCopyMenu] = useState<{ card: Card; x: number; y: number } | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(
     () => localStorage.getItem("notestash.sidebar") !== "closed"
   );
@@ -704,6 +707,34 @@ export default function App() {
 
   const setCardNoteView = (colId: string, card: Card, view: CardView) =>
     saveCard(colId, { ...card, view });
+
+  // Copy a note's text to the clipboard: the title alone, or title + details.
+  const copyCardToClipboard = async (card: Card, mode: "title" | "both") => {
+    const text =
+      mode === "title"
+        ? card.title.trim()
+        : [card.title, card.body].map((s) => s.trim()).filter(Boolean).join("\n\n");
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Fallback for webviews where the async clipboard API is unavailable.
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+      } catch {
+        // nothing else to try
+      }
+      document.body.removeChild(ta);
+    }
+    setCopiedId(card.id);
+    window.setTimeout(() => setCopiedId((id) => (id === card.id ? null : id)), 1200);
+  };
 
   const deleteCard = (colId: string, cardId: string) => {
     const card = activeBoard.columns.find((c) => c.id === colId)?.cards.find((cd) => cd.id === cardId);
@@ -1397,6 +1428,18 @@ export default function App() {
                         setCardMenu({ colId: col.id, card, x: e.clientX, y: e.clientY });
                       }}
                     >
+                      <button
+                        type="button"
+                        className="card-copy"
+                        title="Copy note to clipboard"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                          setCopyMenu({ card, x: r.right, y: r.bottom + 4 });
+                        }}
+                      >
+                        {copiedId === card.id ? "✓" : "⧉"}
+                      </button>
                       <CardContent card={card} labels={labels} cardView={cardView} />
                     </article>
                   </div>
@@ -1452,6 +1495,46 @@ export default function App() {
             </div>
           ) : null;
         })()}
+
+      {copyMenu && (
+        <>
+          <div
+            className="menu-overlay"
+            onMouseDown={() => setCopyMenu(null)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setCopyMenu(null);
+            }}
+          />
+          <div
+            className="context-menu copy-menu"
+            style={{
+              left: Math.max(8, Math.min(copyMenu.x - 210, window.innerWidth - 218)),
+              top: Math.max(8, Math.min(copyMenu.y, window.innerHeight - 110)),
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <button
+              className="context-menu-open"
+              onClick={() => {
+                copyCardToClipboard(copyMenu.card, "title");
+                setCopyMenu(null);
+              }}
+            >
+              Copy title only
+            </button>
+            <button
+              className="context-menu-open"
+              onClick={() => {
+                copyCardToClipboard(copyMenu.card, "both");
+                setCopyMenu(null);
+              }}
+            >
+              Copy title + description
+            </button>
+          </div>
+        </>
+      )}
 
       {cardMenu && (
         <>
