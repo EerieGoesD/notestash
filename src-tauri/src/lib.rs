@@ -94,6 +94,96 @@ fn delete_image(app: tauri::AppHandle, file_name: String) -> Result<(), String> 
     Ok(())
 }
 
+/// What the app itself is costing the machine right now: share of the
+/// processor since the last look, and share of the memory in use.
+#[cfg(windows)]
+fn read_usage() -> (String, String) {
+    use std::sync::Mutex;
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::SystemInformation::{
+        GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    static LAST: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
+    let hundred_ns =
+        |time: FILETIME| ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64;
+
+    unsafe {
+        let process = GetCurrentProcess();
+        let (mut created, mut exited, mut kernel, mut user) = Default::default();
+        let cpu = if GetProcessTimes(
+            process,
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+        .is_ok()
+        {
+            let busy = hundred_ns(kernel) + hundred_ns(user);
+            let now = std::time::Instant::now();
+            let mut cores = SYSTEM_INFO::default();
+            GetSystemInfo(&mut cores);
+            let cores = cores.dwNumberOfProcessors.max(1) as f64;
+
+            let mut last = LAST.lock().ok();
+            let share = match last.as_ref().and_then(|slot| slot.as_ref()) {
+                Some((was_busy, was_at)) => {
+                    let elapsed = now.duration_since(*was_at).as_secs_f64();
+                    if elapsed <= 0.0 {
+                        0.0
+                    } else {
+                        let spent = busy.saturating_sub(*was_busy) as f64 / 10_000_000.0;
+                        (spent / elapsed / cores * 100.0).clamp(0.0, 100.0)
+                    }
+                }
+                None => 0.0,
+            };
+            if let Some(slot) = last.as_mut() {
+                **slot = Some((busy, now));
+            }
+            format!("{:.1}%", share)
+        } else {
+            "n/a".to_string()
+        };
+
+        let mut counters = PROCESS_MEMORY_COUNTERS::default();
+        let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let mut total = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        let ram = if GetProcessMemoryInfo(process, &mut counters, size).is_ok()
+            && GlobalMemoryStatusEx(&mut total).is_ok()
+            && total.ullTotalPhys > 0
+        {
+            format!(
+                "{:.1}%",
+                counters.WorkingSetSize as f64 / total.ullTotalPhys as f64 * 100.0
+            )
+        } else {
+            "n/a".to_string()
+        };
+
+        (cpu, ram)
+    }
+}
+
+/// CPU and memory this process is using, as ready-to-show strings.
+#[tauri::command]
+fn usage() -> (String, String) {
+    #[cfg(windows)]
+    {
+        read_usage()
+    }
+    #[cfg(not(windows))]
+    {
+        ("n/a".to_string(), "n/a".to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -106,7 +196,8 @@ pub fn run() {
             import_board,
             save_image,
             load_image,
-            delete_image
+            delete_image,
+            usage
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

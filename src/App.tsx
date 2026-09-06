@@ -28,7 +28,13 @@ type Card = {
   createdAt: number;
 };
 type Column = { id: string; title: string; cards: Card[] };
-type Board = { id: string; title: string; columns: Column[] };
+type Board = {
+  id: string;
+  title: string;
+  columns: Column[];
+  createdAt: number;
+  updatedAt: number; // bumped whenever anything on the board changes
+};
 // An archived (binned) note keeps where it came from so it can be restored.
 type ArchivedCard = { card: Card; boardId: string; colId: string; archivedAt: number };
 // `labels` maps a color key to the name the user gave it (Trello-style).
@@ -237,6 +243,8 @@ function makeFirstBoard(): Board {
   return {
     id: uid(),
     title: "My Board",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
     columns: [
       {
         id: uid(),
@@ -262,15 +270,20 @@ function makeFirstBoard(): Board {
   };
 }
 
-function makeNewBoard(title: string): Board {
+// `withDefaultColumns` off means a blank board (settings tickbox).
+function makeNewBoard(title: string, withDefaultColumns = true): Board {
   return {
     id: uid(),
     title,
-    columns: [
-      { id: uid(), title: "To Do", cards: [] },
-      { id: uid(), title: "Doing", cards: [] },
-      { id: uid(), title: "Done", cards: [] },
-    ],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    columns: withDefaultColumns
+      ? [
+          { id: uid(), title: "To Do", cards: [] },
+          { id: uid(), title: "Doing", cards: [] },
+          { id: uid(), title: "Done", cards: [] },
+        ]
+      : [],
   };
 }
 
@@ -318,11 +331,14 @@ function normalizeColumn(raw: any): Column {
 }
 
 function normalizeBoard(raw: any): Board {
-  const columns = Array.isArray(raw?.columns) ? raw.columns.map(normalizeColumn) : [];
+  const now = Date.now();
+  const createdAt = typeof raw?.createdAt === "number" ? raw.createdAt : now;
   return {
     id: typeof raw?.id === "string" ? raw.id : uid(),
     title: typeof raw?.title === "string" ? raw.title : "My Board",
-    columns: columns.length ? columns : makeNewBoard("My Board").columns,
+    createdAt,
+    updatedAt: typeof raw?.updatedAt === "number" ? raw.updatedAt : createdAt,
+    columns: Array.isArray(raw?.columns) ? raw.columns.map(normalizeColumn) : [],
   };
 }
 
@@ -388,6 +404,16 @@ export default function App() {
     () => localStorage.getItem("notestash.sidebar") !== "closed"
   );
   const [view, setView] = useState<"board" | "archive" | "danger">("board");
+  const [showSettings, setShowSettings] = useState(false);
+  const [showUsage, setShowUsage] = useState(
+    () => localStorage.getItem("notestash.showUsage") !== "0"
+  );
+  const [defaultColumns, setDefaultColumns] = useState(
+    () => localStorage.getItem("notestash.defaultColumns") !== "0"
+  );
+  const [usage, setUsage] = useState<{ cpu: string; ram: string }>({ cpu: "", ram: "" });
+  const [sortMenu, setSortMenu] = useState(false);
+  const [dragBoardId, setDragBoardId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [editingBoardId, setEditingBoardId] = useState<string | null>(null);
   const [editingCard, setEditingCard] = useState<{ colId: string; card: Card } | null>(null);
@@ -411,6 +437,7 @@ export default function App() {
   const dragCardIdRef = useRef<string | null>(null);
   const cardPointerRef = useRef<{ x: number; y: number } | null>(null);
   const cardScrollRafRef = useRef<number | null>(null);
+  const boardDraggedRef = useRef(false);
 
   const activeBoard =
     workspace.boards.find((b) => b.id === workspace.activeBoardId) ?? workspace.boards[0];
@@ -451,6 +478,35 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("notestash.sidebar", sidebarOpen ? "open" : "closed");
   }, [sidebarOpen]);
+  useEffect(() => {
+    localStorage.setItem("notestash.showUsage", showUsage ? "1" : "0");
+  }, [showUsage]);
+  useEffect(() => {
+    localStorage.setItem("notestash.defaultColumns", defaultColumns ? "1" : "0");
+  }, [defaultColumns]);
+
+  // ── Live CPU / memory readout (only polled while it is on screen) ──
+  useEffect(() => {
+    if (!showUsage) {
+      setUsage({ cpu: "", ram: "" });
+      return;
+    }
+    let alive = true;
+    const read = async () => {
+      try {
+        const [cpu, ram] = await invoke<[string, string]>("usage");
+        if (alive) setUsage({ cpu, ram });
+      } catch {
+        if (alive) setUsage({ cpu: "n/a", ram: "n/a" });
+      }
+    };
+    read();
+    const t = setInterval(read, 2000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [showUsage]);
 
   // ── Close the card context menu on Escape ──
   useEffect(() => {
@@ -471,7 +527,9 @@ export default function App() {
   const updateActiveBoard = (updater: (b: Board) => Board) =>
     setWorkspace((ws) => ({
       ...ws,
-      boards: ws.boards.map((b) => (b.id === ws.activeBoardId ? updater(b) : b)),
+      boards: ws.boards.map((b) =>
+        b.id === ws.activeBoardId ? { ...updater(b), updatedAt: Date.now() } : b
+      ),
     }));
 
   // ── Label definitions (shared across all boards) ──
@@ -480,7 +538,7 @@ export default function App() {
 
   // ── Board operations (sidebar) ──
   const addBoard = () => {
-    const b = makeNewBoard("New Board");
+    const b = makeNewBoard("New Board", defaultColumns);
     setWorkspace((ws) => ({ ...ws, boards: [...ws.boards, b], activeBoardId: b.id }));
     setEditingBoardId(b.id);
     setView("board");
@@ -489,8 +547,60 @@ export default function App() {
   const renameBoard = (id: string, title: string) =>
     setWorkspace((ws) => ({
       ...ws,
-      boards: ws.boards.map((b) => (b.id === id ? { ...b, title } : b)),
+      boards: ws.boards.map((b) => (b.id === id ? { ...b, title, updatedAt: Date.now() } : b)),
     }));
+
+  // Reorder the sidebar list by dropping one board onto another's slot.
+  const moveBoardOnto = (dragId: string, overId: string) =>
+    setWorkspace((ws) => {
+      const from = ws.boards.findIndex((b) => b.id === dragId);
+      const to = ws.boards.findIndex((b) => b.id === overId);
+      if (from < 0 || to < 0 || from === to) return ws;
+      const boards = [...ws.boards];
+      const [moved] = boards.splice(from, 1);
+      boards.splice(to, 0, moved);
+      return { ...ws, boards };
+    });
+
+  const sortBoards = (by: "name" | "created" | "changed") =>
+    setWorkspace((ws) => ({
+      ...ws,
+      boards: [...ws.boards].sort((a, b) =>
+        by === "name"
+          ? a.title.localeCompare(b.title, undefined, { sensitivity: "base" })
+          : by === "created"
+            ? a.createdAt - b.createdAt
+            : b.updatedAt - a.updatedAt
+      ),
+    }));
+
+  // Hold a board and move it; a plain click still selects it.
+  const startBoardDrag = (e: ReactPointerEvent, id: string) => {
+    if (e.button !== 0) return;
+    boardDraggedRef.current = false;
+    if ((e.target as HTMLElement).closest("button, input")) return;
+    const startY = e.clientY;
+    let started = false;
+
+    const onMove = (ev: PointerEvent) => {
+      if (!started) {
+        if (Math.abs(ev.clientY - startY) < 5) return;
+        started = true;
+        boardDraggedRef.current = true;
+        setDragBoardId(id);
+      }
+      const el = document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null;
+      const overId = el?.closest<HTMLElement>("[data-board-id]")?.getAttribute("data-board-id");
+      if (overId && overId !== id) moveBoardOnto(id, overId);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      setDragBoardId(null);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
 
   // In-app themed confirmation. Returns a promise that resolves when the user
   // picks an option (window.confirm and the native dialog don't fit the theme).
@@ -1114,6 +1224,27 @@ export default function App() {
           <div className="brand">
             <span className="brand-mark">▦</span>
             <h1>NoteStash</h1>
+            <button
+              className="brand-theme"
+              onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+              title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            >
+              {theme === "dark" ? (
+                <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="12" cy="12" r="4.5" fill="currentColor" />
+                  <g stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                    <path d="M12 2.5v2.6M12 18.9v2.6M2.5 12h2.6M18.9 12h2.6M5.22 5.22l1.84 1.84M16.94 16.94l1.84 1.84M18.78 5.22l-1.84 1.84M7.06 16.94l-1.84 1.84" />
+                  </g>
+                </svg>
+              ) : (
+                <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    d="M20.5 14.2A8.6 8.6 0 0 1 9.8 3.5a8.6 8.6 0 1 0 10.7 10.7z"
+                    fill="currentColor"
+                  />
+                </svg>
+              )}
+            </button>
           </div>
         </div>
 
@@ -1156,13 +1287,6 @@ export default function App() {
 
         <div className="topbar-actions">
           {status && <span className="status">{status}</span>}
-          <button
-            className="btn btn-ghost theme-toggle"
-            onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-            title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-          >
-            {theme === "dark" ? "☀" : "☾"}
-          </button>
           <select
             className="view-select"
             value={cardView}
@@ -1174,7 +1298,13 @@ export default function App() {
           </select>
           <button className="btn btn-ghost" onClick={importBoard}>Import</button>
           <button className="btn btn-ghost" onClick={exportBoard}>Export</button>
-          <button className="btn btn-accent" onClick={addColumn}>+ Column</button>
+          <button
+            className="btn btn-ghost theme-toggle"
+            onClick={() => setShowSettings(true)}
+            title="Settings"
+          >
+            ⚙
+          </button>
         </div>
       </header>
 
@@ -1182,17 +1312,71 @@ export default function App() {
         <aside className={"sidebar" + (sidebarOpen ? "" : " collapsed")}>
           <div className="sidebar-head">
             <span className="sidebar-title">Boards</span>
-            <button className="icon-btn" title="Add board" onClick={addBoard}>+</button>
+            <div className="sidebar-head-tools">
+              <button className="icon-btn" title="Add board" onClick={addBoard}>+</button>
+              <div className="sort-wrap">
+                <button
+                  className="icon-btn"
+                  title="Sort boards"
+                  onClick={() => setSortMenu((o) => !o)}
+                >
+                  ⇅
+                </button>
+                {sortMenu && (
+                  <>
+                    <div className="menu-overlay" onMouseDown={() => setSortMenu(false)} />
+                    <div className="sort-menu">
+                      <button
+                        className="context-menu-open"
+                        onClick={() => {
+                          sortBoards("name");
+                          setSortMenu(false);
+                        }}
+                      >
+                        Alphabetically
+                      </button>
+                      <button
+                        className="context-menu-open"
+                        onClick={() => {
+                          sortBoards("created");
+                          setSortMenu(false);
+                        }}
+                      >
+                        Date Created
+                      </button>
+                      <button
+                        className="context-menu-open"
+                        onClick={() => {
+                          sortBoards("changed");
+                          setSortMenu(false);
+                        }}
+                      >
+                        Last Changed
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
           </div>
           <div className="board-list">
             {workspace.boards.map((b) => (
               <div
                 key={b.id}
+                data-board-id={b.id}
                 className={
                   "board-item" +
-                  (view === "board" && b.id === workspace.activeBoardId ? " active" : "")
+                  (view === "board" && b.id === workspace.activeBoardId ? " active" : "") +
+                  (dragBoardId === b.id ? " is-board-drag" : "")
                 }
-                onClick={() => selectBoard(b.id)}
+                onPointerDown={(e) => startBoardDrag(e, b.id)}
+                onClick={() => {
+                  if (boardDraggedRef.current) {
+                    boardDraggedRef.current = false;
+                    return;
+                  }
+                  selectBoard(b.id);
+                }}
               >
                 {editingBoardId === b.id ? (
                   <input
@@ -1457,7 +1641,17 @@ export default function App() {
       </div>
 
       <footer className="global-footer">
-        <span className="footer-version">v{__APP_VERSION__}</span>
+        <div className="footer-meta">
+          <span className="footer-version">v{__APP_VERSION__}</span>
+          {showUsage && (
+            <>
+              <span className="sep">|</span>
+              <span className="footer-version">CPU: {usage.cpu || "..."}</span>
+              <span className="sep">|</span>
+              <span className="footer-version">RAM: {usage.ram || "..."}</span>
+            </>
+          )}
+        </div>
         <div className="footer-links">
           <a className="link-coffee" onClick={link("https://buymeacoffee.com/eeriegoesd")}>
             Support This Project
@@ -1479,6 +1673,56 @@ export default function App() {
           </a>
         </div>
       </footer>
+
+      {view === "board" && (
+        <button className="add-fab" type="button" title="New column" onClick={addColumn}>
+          <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              d="M12 5v14M5 12h14"
+              stroke="currentColor"
+              strokeWidth="2.6"
+              strokeLinecap="round"
+            />
+          </svg>
+          <span>Column</span>
+        </button>
+      )}
+
+      {showSettings && (
+        <div className="modal-overlay" onClick={() => setShowSettings(false)}>
+          <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+            <h2 className="settings-title">Settings</h2>
+            <label className="settings-row">
+              <input
+                type="checkbox"
+                checked={showUsage}
+                onChange={(e) => setShowUsage(e.target.checked)}
+              />
+              <span>
+                Show CPU + Memory usage
+                <span className="settings-hint">In the footer, for NoteStash only</span>
+              </span>
+            </label>
+            <label className="settings-row">
+              <input
+                type="checkbox"
+                checked={defaultColumns}
+                onChange={(e) => setDefaultColumns(e.target.checked)}
+              />
+              <span>
+                Start new boards with To Do / Doing / Done
+                <span className="settings-hint">Off means a new board starts empty</span>
+              </span>
+            </label>
+            <div className="modal-actions">
+              <div className="spacer" />
+              <button className="btn btn-accent" onClick={() => setShowSettings(false)}>
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {dragGhost &&
         dragCard &&
