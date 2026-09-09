@@ -1,7 +1,7 @@
 {
   "name": "notestash",
   "private": true,
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "A fast, local note board - jot quick notes into categories and drag them around like Trello.",
   "type": "module",
   "scripts": {
@@ -14,6 +14,7 @@
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-opener": "^2",
+    "pdfjs-dist": "^6.3.289",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

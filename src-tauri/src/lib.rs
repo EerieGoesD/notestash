@@ -1,6 +1,82 @@
 use base64::{engine::general_purpose, Engine as _};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::Manager;
+
+/// The sync code and the address this device is signed in as. Kept in a file
+/// next to the board, not in the browser store, so clearing the app's cache
+/// does not silently sign the device out. The PASSWORD is never kept.
+#[derive(Serialize, Deserialize, Default)]
+struct SyncConfig {
+    /// Reaches this account's copy on the server. Empty when signed out. The
+    /// user never sees it; signing in fetches it.
+    #[serde(default)]
+    code: String,
+    /// Shown in Settings so people know who they are signed in as.
+    #[serde(default)]
+    email: String,
+}
+
+fn sync_config_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("cannot resolve app data dir: {}", e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create app data dir: {}", e))?;
+    Ok(dir.join("sync.json"))
+}
+
+fn read_sync_config(app: &tauri::AppHandle) -> SyncConfig {
+    sync_config_path(app)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_sync_config(app: &tauri::AppHandle, config: &SyncConfig) -> Result<(), String> {
+    let path = sync_config_path(app)?;
+    let text = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| format!("cannot save sync settings: {}", e))
+}
+
+#[tauri::command]
+fn sync_code(app: tauri::AppHandle) -> String {
+    read_sync_config(&app).code
+}
+
+#[tauri::command]
+fn set_sync_code(app: tauri::AppHandle, code: String) -> Result<(), String> {
+    let mut config = read_sync_config(&app);
+    config.code = code;
+    write_sync_config(&app, &config)
+}
+
+#[tauri::command]
+fn sync_email(app: tauri::AppHandle) -> String {
+    read_sync_config(&app).email
+}
+
+#[tauri::command]
+fn set_sync_email(app: tauri::AppHandle, email: String) -> Result<(), String> {
+    let mut config = read_sync_config(&app);
+    config.email = email;
+    write_sync_config(&app, &config)
+}
+
+/// Keep a copy of the board as it stands, under a name that says when it was
+/// parked. Used when another device's version wins, so nothing this device did
+/// is ever thrown away.
+#[tauri::command]
+fn park_conflict(app: tauri::AppHandle, data: String) -> Result<String, String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = board_path(&app)?.with_file_name(format!("board.conflict.{}.json", stamp));
+    std::fs::write(&path, data).map_err(|e| format!("cannot keep a copy: {}", e))?;
+    Ok(path.to_string_lossy().to_string())
+}
 
 /// Resolve the path to the board file inside the app data directory,
 /// creating the directory if it does not exist yet.
@@ -21,6 +97,17 @@ fn images_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| format!("cannot resolve app data dir: {}", e))?
         .join("images");
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create images dir: {}", e))?;
+    Ok(dir)
+}
+
+/// Resolve (and create) the folder where attached PDFs are kept.
+fn files_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("cannot resolve app data dir: {}", e))?
+        .join("files");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create files dir: {}", e))?;
     Ok(dir)
 }
 
@@ -88,6 +175,54 @@ fn load_image(app: tauri::AppHandle, file_name: String) -> Result<String, String
 fn delete_image(app: tauri::AppHandle, file_name: String) -> Result<(), String> {
     let dir = images_dir(&app)?;
     let path = dir.join(safe_name(&file_name)?);
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
+}
+
+/// Copy a picked file into the app's own files folder, under the given name.
+#[tauri::command]
+fn attach_file(app: tauri::AppHandle, source: String, file_name: String) -> Result<u64, String> {
+    let dir = files_dir(&app)?;
+    let dest = dir.join(safe_name(&file_name)?);
+    std::fs::copy(&source, &dest).map_err(|e| format!("cannot copy file: {}", e))
+}
+
+/// Write a pasted file (base64) into the app's files folder.
+#[tauri::command]
+fn put_file(app: tauri::AppHandle, file_name: String, data_base64: String) -> Result<(), String> {
+    let dir = files_dir(&app)?;
+    let bytes = general_purpose::STANDARD
+        .decode(data_base64.as_bytes())
+        .map_err(|e| format!("cannot decode file: {}", e))?;
+    std::fs::write(dir.join(safe_name(&file_name)?), bytes)
+        .map_err(|e| format!("cannot save file: {}", e))
+}
+
+/// Read a stored file back as base64, so its text can be pulled out.
+#[tauri::command]
+fn read_file(app: tauri::AppHandle, file_name: String) -> Result<String, String> {
+    let dir = files_dir(&app)?;
+    let bytes = std::fs::read(dir.join(safe_name(&file_name)?))
+        .map_err(|e| format!("cannot read file: {}", e))?;
+    Ok(general_purpose::STANDARD.encode(bytes))
+}
+
+/// Absolute path of a stored file, so it can be opened with the default app.
+#[tauri::command]
+fn file_path(app: tauri::AppHandle, file_name: String) -> Result<String, String> {
+    let path = files_dir(&app)?.join(safe_name(&file_name)?);
+    if !path.exists() {
+        return Err("file not found".to_string());
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Delete a stored file (best effort).
+#[tauri::command]
+fn delete_file(app: tauri::AppHandle, file_name: String) -> Result<(), String> {
+    let path = files_dir(&app)?.join(safe_name(&file_name)?);
     if path.exists() {
         let _ = std::fs::remove_file(path);
     }
@@ -197,6 +332,16 @@ pub fn run() {
             save_image,
             load_image,
             delete_image,
+            attach_file,
+            put_file,
+            read_file,
+            file_path,
+            delete_file,
+            sync_code,
+            set_sync_code,
+            sync_email,
+            set_sync_email,
+            park_conflict,
             usage
         ])
         .run(tauri::generate_context!())

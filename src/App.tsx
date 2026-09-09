@@ -3,6 +3,7 @@ import {
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useRef,
@@ -10,15 +11,74 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save, open } from "@tauri-apps/plugin-dialog";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
+// ── Account sync ────────────────────────────────────────────────────
+// One shared service for all the apps; the name in the address keeps this
+// app's data apart from the others. Only the board's text travels: images and
+// PDFs stay on the device they were added on.
+const SYNC_URL = "https://eerie-apps-sync.eeriegoesd.workers.dev/data/notestash";
+const ACCOUNT_URL = "https://eerie-apps-sync.eeriegoesd.workers.dev/account";
+
+/**
+ * Turns the password into the key that actually travels. THE PASSWORD ITSELF
+ * NEVER LEAVES THIS MACHINE. Slow on purpose: the service cannot do this work,
+ * so this is the whole defence for a password someone could guess. The address
+ * is the salt, so the same password on two accounts gives two different keys.
+ */
+async function passwordKey(email: string, password: string): Promise<string> {
+  const enc = new TextEncoder();
+  const material = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, [
+    "deriveBits",
+  ]);
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      hash: "SHA-256",
+      salt: enc.encode("eerie-account|" + email.trim().toLowerCase()),
+      iterations: 600000,
+    },
+    material,
+    256
+  );
+  let raw = "";
+  for (const b of new Uint8Array(bits)) raw += String.fromCharCode(b);
+  return btoa(raw);
+}
+
+async function accountCall(
+  action: string,
+  body: Record<string, unknown>
+): Promise<{ code?: string }> {
+  const res = await fetch(`${ACCOUNT_URL}/${action}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = (await res.json().catch(() => ({}))) as {
+    code?: string;
+    error?: string;
+    needsVerify?: boolean;
+  };
+  if (!res.ok) {
+    const err = new Error(data.error || "Could not reach the sync service");
+    if (data.needsVerify) (err as Error & { needsVerify?: boolean }).needsVerify = true;
+    throw err;
+  }
+  return data;
+}
+
 // ── Data model ──────────────────────────────────────────────────────
+// An attached PDF: `name` is the file stored in the app's files folder,
+// `label` is the name it had when it was picked.
+type NoteFile = { name: string; label: string };
 type Card = {
   id: string;
   title: string;
   body: string;
   label: string;
+  files?: NoteFile[]; // attached PDFs
   images: string[]; // images[0] is the card thumbnail (cover)
   imageMeta?: Record<string, { orig: number; size: number }>; // per-image byte sizes
   view?: "details" | "titles"; // per-note override of the global titles/details view
@@ -193,6 +253,81 @@ function NoteImage({
   return <img className={className} src={src} alt="" draggable={false} style={style} />;
 }
 
+// ── Pulling the text out of a PDF ──
+// pdf.js is loaded only when someone actually asks for the text, so the app
+// starts no slower for people who never attach one.
+async function pdfToText(base64: string): Promise<string> {
+  const pdfjs = await import("pdfjs-dist");
+  const worker = await import("pdfjs-dist/build/pdf.worker.mjs?url");
+  pdfjs.GlobalWorkerOptions.workerSrc = worker.default;
+
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+  const task = pdfjs.getDocument({ data: bytes });
+  const doc = await task.promise;
+  const pages: string[] = [];
+  for (let n = 1; n <= doc.numPages; n++) {
+    const page = await doc.getPage(n);
+    const content = await page.getTextContent();
+    // Join the pieces, and start a new line whenever the text moves down.
+    let text = "";
+    let lastY: number | null = null;
+    for (const item of content.items as Array<{ str?: string; transform?: number[] }>) {
+      if (typeof item.str !== "string") continue;
+      const y = item.transform?.[5] ?? null;
+      if (lastY !== null && y !== null && Math.abs(y - lastY) > 2) text += "\n";
+      text += item.str;
+      lastY = y;
+    }
+    pages.push(text.trim());
+  }
+  await task.destroy();
+  return pages.filter(Boolean).join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// ── Note bodies ──
+// A body is stored as HTML. Notes written before rich text are plain text, so
+// everything that reads a body goes through these.
+const looksLikeHtml = (s: string) =>
+  /<(br|div|p|ul|ol|li|pre|strong|b|em|i|s|strike|code|span)\b[^>]*>/i.test(s);
+
+function bodyToHtml(body: string): string {
+  if (!body) return "";
+  if (looksLikeHtml(body)) return body;
+  return body
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\n/g, "<br>");
+}
+
+// Plain text version, for search, the clipboard and the board dump.
+function bodyToText(body: string): string {
+  if (!body) return "";
+  if (!looksLikeHtml(body)) return body;
+  return body
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<li[^>]*>/gi, "\n- ")
+    .replace(/<\/(div|p|li|pre|ul|ol|h[1-6])>/gi, "\n")
+    .replace(/<[^>]*>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// Cheap check so an empty editor (which leaves stray tags behind) shows nothing.
+function bodyIsEmpty(body: string): boolean {
+  if (!body) return true;
+  return !body.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").trim();
+}
+
 // The inner visual of a card (cover, label, title, body). Shared by the real
 // card and the floating drag ghost so they always match.
 function CardContent({
@@ -225,7 +360,15 @@ function CardContent({
           <div className="card-label" style={{ background: LABEL_COLORS[card.label] }} />
         ))}
       <div className="card-title">{card.title || "Untitled note"}</div>
-      {view === "details" && card.body && <div className="card-body">{card.body}</div>}
+      {view === "details" && !bodyIsEmpty(card.body) && (
+        <div className="card-body" dangerouslySetInnerHTML={{ __html: bodyToHtml(card.body) }} />
+      )}
+      {!!card.files?.length && (
+        <div className="card-files">
+          <span className="pdf-tag">PDF</span>
+          {card.files.length === 1 ? card.files[0].label : `${card.files.length} files`}
+        </div>
+      )}
     </>
   );
 }
@@ -313,6 +456,14 @@ function normalizeCard(raw: any): Card {
     body: typeof raw?.body === "string" ? raw.body : "",
     label: typeof raw?.label === "string" && raw.label in LABEL_COLORS ? raw.label : "",
     images: Array.isArray(raw?.images) ? raw.images.filter((s: any) => typeof s === "string") : [],
+    files: Array.isArray(raw?.files)
+      ? raw.files
+          .filter((f: any) => f && typeof f.name === "string")
+          .map((f: any) => ({
+            name: f.name,
+            label: typeof f.label === "string" && f.label ? f.label : f.name,
+          }))
+      : [],
     imageMeta: normalizeImageMeta(raw?.imageMeta),
     view: raw?.view === "details" || raw?.view === "titles" ? raw.view : undefined,
     coverX: typeof raw?.coverX === "number" ? raw.coverX : 50,
@@ -413,6 +564,7 @@ export default function App() {
   );
   const [usage, setUsage] = useState<{ cpu: string; ram: string }>({ cpu: "", ram: "" });
   const [sortMenu, setSortMenu] = useState(false);
+  const [exportMenu, setExportMenu] = useState<{ x: number; y: number } | null>(null);
   const [dragBoardId, setDragBoardId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [editingBoardId, setEditingBoardId] = useState<string | null>(null);
@@ -429,7 +581,23 @@ export default function App() {
   const [colDrag, setColDrag] = useState<ColDrag | null>(null);
   const [status, setStatus] = useState<string>("");
 
+  // ── Account sync ──
+  const [syncCode, setSyncCode] = useState("");
+  const [syncEmail, setSyncEmail] = useState("");
+  const [syncState, setSyncState] = useState<"off" | "idle" | "busy" | "failed">("off");
+  const [accountBusy, setAccountBusy] = useState(false);
+  // Shown once, the first time the app is opened, so nobody puts a month of
+  // work in believing it is following them to their other machines.
+  const [welcome, setWelcome] = useState(
+    () => localStorage.getItem("notestash.seenWelcome") !== "1"
+  );
+
   const loadedRef = useRef(false);
+  // The server's own write time for the copy this device last saw.
+  const serverStampRef = useRef(0);
+  const syncCodeRef = useRef("");
+  syncCodeRef.current = syncCode;
+  const workspaceRef = useRef<Workspace | null>(null);
   const boardRef = useRef<HTMLDivElement | null>(null);
   const colDragRef = useRef<ColDrag | null>(null);
   const colGeomRef = useRef<{ centers: number[]; slot: number; startX: number } | null>(null);
@@ -523,6 +691,132 @@ export default function App() {
     window.setTimeout(() => setStatus(""), 2200);
   }, []);
 
+  // ── Sync: push and pull the board's text ──
+  workspaceRef.current = workspace;
+
+  // Read the saved code and address back on startup.
+  useEffect(() => {
+    invoke<string>("sync_code").then(setSyncCode).catch(() => {});
+    invoke<string>("sync_email").then(setSyncEmail).catch(() => {});
+  }, []);
+
+  /**
+   * Take whatever the server has. The board on screen is parked as a conflict
+   * file first, so a device that was working offline never loses its work.
+   */
+  const takeServerWorkspace = useCallback(async (text: string, stamp: number) => {
+    let parsed: Workspace;
+    try {
+      parsed = normalizeWorkspace(JSON.parse(text));
+    } catch {
+      return;
+    }
+    await invoke("park_conflict", { data: JSON.stringify(workspaceRef.current) }).catch(() => {});
+    serverStampRef.current = stamp;
+    setWorkspace(parsed);
+  }, []);
+
+  /** Fetch the board from the server and use it when it is newer than ours. */
+  const pullWorkspace = useCallback(
+    async (announce: boolean) => {
+      const code = syncCodeRef.current;
+      if (!code) return;
+      setSyncState("busy");
+      try {
+        const res = await fetch(`${SYNC_URL}?code=${code}`);
+        if (res.status === 404) {
+          // Nothing up there yet; the next save puts this device's board online.
+          serverStampRef.current = 0;
+          setSyncState("idle");
+          return;
+        }
+        if (!res.ok) throw new Error(String(res.status));
+        const body = (await res.json()) as { data: string; updatedAt: number };
+        if (body.updatedAt !== serverStampRef.current) {
+          await takeServerWorkspace(body.data, body.updatedAt);
+          if (announce) flash("Brought down from your other device");
+        }
+        setSyncState("idle");
+      } catch {
+        setSyncState("failed");
+      }
+    },
+    [takeServerWorkspace, flash]
+  );
+
+  /** Send the board up. A refusal means another device got there first. */
+  const pushWorkspace = useCallback(
+    async (data: Workspace) => {
+      const code = syncCodeRef.current;
+      if (!code) return;
+      setSyncState("busy");
+      try {
+        const res = await fetch(SYNC_URL, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            code,
+            data: JSON.stringify(data),
+            base: serverStampRef.current,
+          }),
+        });
+        if (res.status === 409) {
+          const body = (await res.json()) as { data: string; updatedAt: number };
+          await takeServerWorkspace(body.data, body.updatedAt);
+          flash("Your other device had newer work, so that version was loaded");
+          setSyncState("idle");
+          return;
+        }
+        if (!res.ok) throw new Error(String(res.status));
+        const body = (await res.json()) as { updatedAt: number };
+        serverStampRef.current = body.updatedAt;
+        setSyncState("idle");
+      } catch {
+        // Offline, or the service is down. The board is safe on this device
+        // and goes up the next time something changes.
+        setSyncState("failed");
+      }
+    },
+    [takeServerWorkspace, flash]
+  );
+
+  // Signing in, or opening the app already signed in, starts by taking
+  // whatever the other devices have done.
+  useEffect(() => {
+    if (!syncCode) {
+      setSyncState("off");
+      return;
+    }
+    serverStampRef.current = 0;
+    pullWorkspace(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncCode]);
+
+  // Uploading waits longer than saving to disk, so a burst of typing becomes
+  // one upload rather than dozens.
+  useEffect(() => {
+    if (!loadedRef.current || !syncCode) return;
+    const id = window.setTimeout(() => pushWorkspace(workspace), 4000);
+    return () => window.clearTimeout(id);
+  }, [workspace, syncCode, pushWorkspace]);
+
+  // Send up when the window loses focus or closes, take down when it returns.
+  useEffect(() => {
+    if (!syncCode) return;
+    const onBlur = () => {
+      if (workspaceRef.current) pushWorkspace(workspaceRef.current);
+    };
+    const onFocus = () => pullWorkspace(true);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("beforeunload", onBlur);
+    return () => {
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("beforeunload", onBlur);
+    };
+  }, [syncCode, pushWorkspace, pullWorkspace]);
+
   // Apply an update to whichever board is currently active.
   const updateActiveBoard = (updater: (b: Board) => Board) =>
     setWorkspace((ws) => ({
@@ -531,6 +825,183 @@ export default function App() {
         b.id === ws.activeBoardId ? { ...updater(b), updatedAt: Date.now() } : b
       ),
     }));
+
+  // ── Account: sign up, sign in, confirm, reset, sign out, delete ──
+  const useAccount = async (
+    action: "signup" | "login",
+    email: string,
+    password: string
+  ): Promise<boolean | "verify"> => {
+    const address = email.trim().toLowerCase();
+    if (!address.includes("@") || !address.includes(".")) {
+      flash("That email address does not look right");
+      return false;
+    }
+    if (password.length < 8) {
+      flash("Use at least 8 characters for the password");
+      return false;
+    }
+    setAccountBusy(true);
+    try {
+      const { code } = await accountCall(action, {
+        email: address,
+        key: await passwordKey(address, password),
+        app: "notestash",
+      });
+      if (action === "signup") {
+        flash("Check your email for a code to confirm this address");
+        return "verify";
+      }
+      if (!code) throw new Error("The service sent nothing back");
+      await invoke("set_sync_code", { code });
+      await invoke("set_sync_email", { email: address });
+      setSyncCode(code);
+      setSyncEmail(address);
+      flash("Signed in, fetching your boards");
+      return true;
+    } catch (e) {
+      if ((e as Error & { needsVerify?: boolean }).needsVerify) {
+        flash(e instanceof Error ? e.message : "Verify the address first");
+        return "verify";
+      }
+      flash(e instanceof Error ? e.message : "Could not reach the sync service");
+      return false;
+    } finally {
+      setAccountBusy(false);
+    }
+  };
+
+  const verifyAccount = async (email: string, token: string) => {
+    const address = email.trim().toLowerCase();
+    if (!/^[0-9]{6}$/.test(token.trim())) {
+      flash("The code from the email is six digits");
+      return false;
+    }
+    setAccountBusy(true);
+    try {
+      const { code } = await accountCall("verify", { email: address, token: token.trim() });
+      if (!code) throw new Error("The service sent nothing back");
+      await invoke("set_sync_code", { code });
+      await invoke("set_sync_email", { email: address });
+      setSyncCode(code);
+      setSyncEmail(address);
+      flash("Address confirmed, sync on");
+      return true;
+    } catch (e) {
+      flash(e instanceof Error ? e.message : "Could not reach the sync service");
+      return false;
+    } finally {
+      setAccountBusy(false);
+    }
+  };
+
+  const forgotPassword = async (email: string) => {
+    const address = email.trim().toLowerCase();
+    if (!address.includes("@")) {
+      flash("That email address does not look right");
+      return false;
+    }
+    setAccountBusy(true);
+    try {
+      await accountCall("forgot", { email: address, app: "notestash" });
+      flash("If that address has an account, a code is on its way");
+      return true;
+    } catch (e) {
+      flash(e instanceof Error ? e.message : "Could not reach the sync service");
+      return false;
+    } finally {
+      setAccountBusy(false);
+    }
+  };
+
+  const resetPassword = async (email: string, token: string, password: string) => {
+    const address = email.trim().toLowerCase();
+    if (!/^[0-9]{6}$/.test(token.trim())) {
+      flash("The code from the email is six digits");
+      return false;
+    }
+    if (password.length < 8) {
+      flash("Use at least 8 characters for the password");
+      return false;
+    }
+    setAccountBusy(true);
+    try {
+      const { code } = await accountCall("reset", {
+        email: address,
+        token: token.trim(),
+        key: await passwordKey(address, password),
+      });
+      if (!code) throw new Error("The service sent nothing back");
+      await invoke("set_sync_code", { code });
+      await invoke("set_sync_email", { email: address });
+      setSyncCode(code);
+      setSyncEmail(address);
+      flash("Password set, sync on");
+      return true;
+    } catch (e) {
+      flash(e instanceof Error ? e.message : "Could not reach the sync service");
+      return false;
+    } finally {
+      setAccountBusy(false);
+    }
+  };
+
+  const signOut = async () => {
+    if (
+      !(await confirmDelete(
+        "Sign out on this device? Your boards and notes stay here, and the copy on the server is left alone so your other devices keep working. Sign in again to pick it back up.",
+        "Sign out"
+      ))
+    )
+      return;
+    await invoke("set_sync_code", { code: "" }).catch(() => {});
+    await invoke("set_sync_email", { email: "" }).catch(() => {});
+    setSyncCode("");
+    setSyncEmail("");
+    serverStampRef.current = 0;
+    flash("Signed out on this device");
+  };
+
+  // Fire and forget: the confirm dialog's Cancel path never runs the action, so
+  // wrapping this in a promise would leak one every time somebody backs out.
+  const deleteAccount = (password: string) => {
+    if (!syncEmail) return;
+    if (password.length < 8) {
+      flash("Type your password to confirm");
+      return;
+    }
+    void (async () => {
+      if (
+        !(await confirmDelete(
+          `Delete the account for ${syncEmail}? The copy of your boards kept for it is deleted from the server, and your other devices stop syncing. Your boards and notes stay on this computer. This cannot be undone.`,
+          "Delete account"
+        ))
+      )
+        return;
+      setAccountBusy(true);
+      try {
+        await accountCall("delete", {
+          email: syncEmail,
+          key: await passwordKey(syncEmail, password),
+        });
+        await invoke("set_sync_code", { code: "" }).catch(() => {});
+        await invoke("set_sync_email", { email: "" }).catch(() => {});
+        setSyncCode("");
+        setSyncEmail("");
+        serverStampRef.current = 0;
+        flash("Account deleted");
+      } catch (e) {
+        flash(e instanceof Error ? e.message : "Could not reach the sync service");
+      } finally {
+        setAccountBusy(false);
+      }
+    })();
+  };
+
+  const dismissWelcome = () => {
+    localStorage.setItem("notestash.seenWelcome", "1");
+    setWelcome(false);
+  };
 
   // ── Label definitions (shared across all boards) ──
   const renameLabel = (color: string, name: string) =>
@@ -823,7 +1294,7 @@ export default function App() {
     const text =
       mode === "title"
         ? card.title.trim()
-        : [card.title, card.body].map((s) => s.trim()).filter(Boolean).join("\n\n");
+        : [card.title, bodyToText(card.body)].map((s) => s.trim()).filter(Boolean).join("\n\n");
     if (!text) return;
     try {
       await navigator.clipboard.writeText(text);
@@ -849,6 +1320,7 @@ export default function App() {
   const deleteCard = (colId: string, cardId: string) => {
     const card = activeBoard.columns.find((c) => c.id === colId)?.cards.find((cd) => cd.id === cardId);
     card?.images.forEach((f) => invoke("delete_image", { fileName: f }).catch(() => {}));
+    card?.files?.forEach((f) => invoke("delete_file", { fileName: f.name }).catch(() => {}));
     updateActiveBoard((b) => ({
       ...b,
       columns: b.columns.map((c) =>
@@ -896,6 +1368,7 @@ export default function App() {
       return;
     const entry = workspace.archived.find((a) => a.card.id === cardId);
     entry?.card.images.forEach((f) => invoke("delete_image", { fileName: f }).catch(() => {}));
+    entry?.card.files?.forEach((f) => invoke("delete_file", { fileName: f.name }).catch(() => {}));
     setWorkspace((ws) => ({ ...ws, archived: ws.archived.filter((a) => a.card.id !== cardId) }));
   };
 
@@ -950,6 +1423,12 @@ export default function App() {
     )
       return;
     allImageNames().forEach((f) => invoke("delete_image", { fileName: f }).catch(() => {}));
+    for (const b of workspace.boards)
+      for (const c of b.columns)
+        for (const cd of c.cards)
+          cd.files?.forEach((f) => invoke("delete_file", { fileName: f.name }).catch(() => {}));
+    for (const a of workspace.archived)
+      a.card.files?.forEach((f) => invoke("delete_file", { fileName: f.name }).catch(() => {}));
     imageUrlCache.clear();
     setWorkspace(makeDefaultWorkspace());
     setView("board");
@@ -999,11 +1478,24 @@ export default function App() {
         // skip an image that fails to copy
       }
     }
+    // Copy each PDF too, so deleting one note never removes the other's file.
+    const newFiles: NoteFile[] = [];
+    for (const f of card.files ?? []) {
+      const newName = `${uid()}.pdf`;
+      try {
+        const source = await invoke<string>("file_path", { fileName: f.name });
+        await invoke("attach_file", { source, fileName: newName });
+        newFiles.push({ name: newName, label: f.label });
+      } catch {
+        // skip a file that fails to copy
+      }
+    }
     const copy: Card = {
       ...card,
       id: uid(),
       images: newImages,
       imageMeta: newMeta,
+      files: newFiles,
       createdAt: Date.now(),
     };
     updateActiveBoard((b) => ({
@@ -1163,7 +1655,9 @@ export default function App() {
     ? workspace.boards.flatMap((b) =>
         b.columns.flatMap((c) =>
           c.cards
-            .filter((card) => (card.title + "\n" + card.body).toLowerCase().includes(q))
+            .filter((card) =>
+              (card.title + "\n" + bodyToText(card.body)).toLowerCase().includes(q)
+            )
             .map((card) => ({ board: b, col: c, card }))
         )
       )
@@ -1175,8 +1669,11 @@ export default function App() {
     setQuery("");
   };
 
-  // ── Export / Import (whole workspace) ──
-  const exportBoard = async () => {
+  // ── Export / Import ──
+  const slug = (s: string) =>
+    s.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "board";
+
+  const exportEverything = async () => {
     try {
       const path = await save({
         defaultPath: "notestash-backup.json",
@@ -1188,6 +1685,59 @@ export default function App() {
     } catch {
       flash("Export failed");
     }
+  };
+
+  // One board on its own, in the same shape so it can be imported back.
+  const exportCurrentBoard = async () => {
+    try {
+      const path = await save({
+        defaultPath: `notestash-${slug(activeBoard.title)}.json`,
+        filters: [{ name: "NoteStash backup", extensions: ["json"] }],
+      });
+      if (!path) return;
+      const one: Workspace = {
+        version: workspace.version,
+        boards: [activeBoard],
+        activeBoardId: activeBoard.id,
+        labels: workspace.labels,
+        archived: workspace.archived.filter((a) => a.boardId === activeBoard.id),
+      };
+      await invoke("export_board", { path, data: JSON.stringify(one, null, 2) });
+      flash("Board exported");
+    } catch {
+      flash("Export failed");
+    }
+  };
+
+  // Plain-text dump of the whole board, for pasting elsewhere.
+  const copyCurrentBoard = async () => {
+    const lines: string[] = [`Board: ${activeBoard.title}`];
+    for (const col of activeBoard.columns) {
+      lines.push("", `Column: ${col.title}`);
+      col.cards.forEach((card, i) => {
+        lines.push(`Note #${i + 1} Title: ${card.title || "Untitled note"}`);
+        const text = bodyToText(card.body);
+        if (text) lines.push(`Note #${i + 1} Description: ${text}`);
+      });
+    }
+    const text = lines.join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+      } catch {
+        // nothing else to try
+      }
+      document.body.removeChild(ta);
+    }
+    flash("Board copied");
   };
 
   const importBoard = async () => {
@@ -1296,8 +1846,16 @@ export default function App() {
             <option value="details">Show titles + details</option>
             <option value="titles">Show titles only</option>
           </select>
-          <button className="btn btn-ghost" onClick={importBoard}>Import</button>
-          <button className="btn btn-ghost" onClick={exportBoard}>Export</button>
+          <button className="btn btn-ghost" onClick={copyCurrentBoard}>Copy Board</button>
+          <button
+            className="btn btn-export"
+            onClick={(e) => {
+              const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+              setExportMenu({ x: r.right, y: r.bottom + 6 });
+            }}
+          >
+            Export ↑
+          </button>
           <button
             className="btn btn-ghost theme-toggle"
             onClick={() => setShowSettings(true)}
@@ -1482,7 +2040,12 @@ export default function App() {
                         />
                       ))}
                     <div className="card-title">{a.card.title || "Untitled note"}</div>
-                    {a.card.body && <div className="card-body">{a.card.body}</div>}
+                    {!bodyIsEmpty(a.card.body) && (
+                      <div
+                        className="card-body"
+                        dangerouslySetInnerHTML={{ __html: bodyToHtml(a.card.body) }}
+                      />
+                    )}
                     <div className="archive-card-actions">
                       <button className="btn btn-ghost" onClick={() => restoreCard(a.card.id)}>
                         Restore
@@ -1636,6 +2199,14 @@ export default function App() {
               <Composer onAdd={(title, body) => addCard(col.id, title, body)} />
             </section>
           ))}
+            <button
+              className="column-add"
+              type="button"
+              title="Add column"
+              onClick={addColumn}
+            >
+              +
+            </button>
           </main>
         )}
       </div>
@@ -1691,33 +2262,120 @@ export default function App() {
       {showSettings && (
         <div className="modal-overlay" onClick={() => setShowSettings(false)}>
           <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
-            <h2 className="settings-title">Settings</h2>
-            <label className="settings-row">
-              <input
-                type="checkbox"
-                checked={showUsage}
-                onChange={(e) => setShowUsage(e.target.checked)}
-              />
-              <span>
-                Show CPU + Memory usage
-                <span className="settings-hint">In the footer, for NoteStash only</span>
+            <div className="settings-head">
+              <h2 className="settings-title">Settings</h2>
+              <span className="settings-control">
+                <button
+                  type="button"
+                  className="settings-close"
+                  title="Close"
+                  onClick={() => setShowSettings(false)}
+                >
+                  ✕
+                </button>
               </span>
-            </label>
-            <label className="settings-row">
-              <input
-                type="checkbox"
-                checked={defaultColumns}
-                onChange={(e) => setDefaultColumns(e.target.checked)}
+            </div>
+            <div className="settings-list">
+              <label className="settings-row">
+                <span className="settings-text">
+                  <span className="settings-label">Show CPU + Memory usage</span>
+                  <span className="settings-hint">In the footer, for NoteStash only</span>
+                </span>
+                <span className="settings-control">
+                  <input
+                    type="checkbox"
+                    checked={showUsage}
+                    onChange={(e) => setShowUsage(e.target.checked)}
+                  />
+                </span>
+              </label>
+              <label className="settings-row">
+                <span className="settings-text">
+                  <span className="settings-label">Start new boards with To Do / Doing / Done</span>
+                  <span className="settings-hint">Off means a new board starts empty</span>
+                </span>
+                <span className="settings-control">
+                  <input
+                    type="checkbox"
+                    checked={defaultColumns}
+                    onChange={(e) => setDefaultColumns(e.target.checked)}
+                  />
+                </span>
+              </label>
+              <div className="settings-row">
+                <span className="settings-text">
+                  <span className="settings-label">Import a backup</span>
+                  <span className="settings-hint">Replaces all your boards with the file</span>
+                </span>
+                <span className="settings-control">
+                  <button
+                    className="btn btn-ghost settings-btn"
+                    onClick={() => {
+                      setShowSettings(false);
+                      importBoard();
+                    }}
+                  >
+                    Import
+                  </button>
+                </span>
+              </div>
+            </div>
+            <div className="settings-section">
+              <h3 className="settings-section-title">Account</h3>
+              <AccountPanel
+                email={syncEmail}
+                syncState={syncState}
+                busy={accountBusy}
+                status={status}
+                onUseAccount={useAccount}
+                onVerify={verifyAccount}
+                onForgot={forgotPassword}
+                onReset={resetPassword}
+                onSignOut={signOut}
+                onDeleteAccount={deleteAccount}
               />
-              <span>
-                Start new boards with To Do / Doing / Done
-                <span className="settings-hint">Off means a new board starts empty</span>
-              </span>
-            </label>
+            </div>
             <div className="modal-actions">
               <div className="spacer" />
               <button className="btn btn-accent" onClick={() => setShowSettings(false)}>
                 Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {welcome && (
+        <div className="modal-overlay" onClick={dismissWelcome}>
+          <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+            <h2 className="settings-title">Welcome to NoteStash</h2>
+            <p className="modal-text">
+              NoteStash works straight away, with no account. Everything you add is saved on this
+              computer and stays there.
+            </p>
+            <p className="modal-text">
+              That also means it stays <strong>only</strong> there. Your notes will not appear on
+              your laptop, your phone or a new machine on their own.
+            </p>
+            <p className="modal-text">
+              To have the same boards everywhere, create an account in Settings. Sign in on another
+              device and everything you have is waiting for you, kept in step from then on. Just an
+              email address and a password. Images and PDFs are the exception: those stay on the
+              device you added them on.
+            </p>
+            <div className="modal-actions">
+              <div className="spacer" />
+              <button className="btn btn-ghost" onClick={dismissWelcome}>
+                Not now
+              </button>
+              <button
+                className="btn btn-accent"
+                onClick={() => {
+                  dismissWelcome();
+                  setShowSettings(true);
+                }}
+              >
+                Open Settings
               </button>
             </div>
           </div>
@@ -1739,6 +2397,39 @@ export default function App() {
             </div>
           ) : null;
         })()}
+
+      {exportMenu && (
+        <>
+          <div className="menu-overlay" onMouseDown={() => setExportMenu(null)} />
+          <div
+            className="context-menu copy-menu"
+            style={{
+              left: Math.max(8, Math.min(exportMenu.x - 210, window.innerWidth - 218)),
+              top: Math.max(8, Math.min(exportMenu.y, window.innerHeight - 110)),
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <button
+              className="context-menu-open"
+              onClick={() => {
+                setExportMenu(null);
+                exportCurrentBoard();
+              }}
+            >
+              Export current board
+            </button>
+            <button
+              className="context-menu-open"
+              onClick={() => {
+                setExportMenu(null);
+                exportEverything();
+              }}
+            >
+              Export everything
+            </button>
+          </div>
+        </>
+      )}
 
       {copyMenu && (
         <>
@@ -2155,6 +2846,460 @@ function LabelDropdown({
   );
 }
 
+// ── The account panel inside Settings. One panel, six states. There is no
+//    sync code anywhere in here: signing in fetches it and nothing shows it. ──
+function AccountPanel({
+  email: signedInAs,
+  syncState,
+  busy,
+  status,
+  onUseAccount,
+  onVerify,
+  onForgot,
+  onReset,
+  onSignOut,
+  onDeleteAccount,
+}: {
+  email: string;
+  syncState: "off" | "idle" | "busy" | "failed";
+  busy: boolean;
+  status: string;
+  onUseAccount: (
+    action: "signup" | "login",
+    email: string,
+    password: string
+  ) => Promise<boolean | "verify">;
+  onVerify: (email: string, token: string) => Promise<boolean>;
+  onForgot: (email: string) => Promise<boolean>;
+  onReset: (email: string, token: string, password: string) => Promise<boolean>;
+  onSignOut: () => void;
+  onDeleteAccount: (password: string) => void;
+}) {
+  const [mode, setMode] = useState<"login" | "signup" | "forgot" | "reset" | "verify">("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [resetToken, setResetToken] = useState("");
+  const [verifyToken, setVerifyToken] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const [deletePassword, setDeletePassword] = useState("");
+  // Stays put until the next step, unlike the top bar's passing message.
+  const [notice, setNotice] = useState("");
+
+  const clearAccountForm = () => {
+    setPassword("");
+    setConfirmPassword("");
+    setResetToken("");
+    setVerifyToken("");
+  };
+
+  const go = (next: typeof mode, message = "") => {
+    clearAccountForm();
+    setNotice(message);
+    setMode(next);
+  };
+
+  const submit = async () => {
+    if (mode === "forgot") {
+      if (await onForgot(email))
+        go(
+          "reset",
+          `If ${email.trim().toLowerCase()} has an account, a six digit code is on its way. Enter it below with a new password. The code lasts 15 minutes.`
+        );
+      return;
+    }
+    if (mode === "reset") {
+      if (await onReset(email, resetToken, password)) clearAccountForm();
+      return;
+    }
+    if (mode === "verify") {
+      if (await onVerify(email, verifyToken)) clearAccountForm();
+      return;
+    }
+    const wasSignup = mode === "signup";
+    const result = await onUseAccount(mode, email, password);
+    if (result === "verify") {
+      go(
+        "verify",
+        wasSignup
+          ? `Account created. A six digit code has been emailed to ${email.trim().toLowerCase()}. Enter it below to confirm the address. Check your spam folder if it does not arrive within a minute.`
+          : `This address is not confirmed yet, so a fresh six digit code has been emailed to ${email.trim().toLowerCase()}. Enter it below.`
+      );
+    } else if (result) clearAccountForm();
+  };
+
+  if (signedInAs) {
+    return (
+      <div className="account-panel">
+        {deleting ? (
+          <>
+            <p className="account-hint">
+              Type your password to delete the account for <strong>{signedInAs}</strong>. Your
+              boards and notes stay on this computer.
+            </p>
+            <input
+              autoFocus
+              className="account-input"
+              type="password"
+              placeholder="Your password"
+              value={deletePassword}
+              onChange={(e) => setDeletePassword(e.target.value)}
+            />
+            <div className="account-actions">
+              <button
+                className="btn btn-ghost danger"
+                disabled={busy}
+                onClick={() => {
+                  onDeleteAccount(deletePassword);
+                  setDeletePassword("");
+                  setDeleting(false);
+                }}
+              >
+                Delete my account
+              </button>
+              <button
+                className="btn btn-ghost"
+                onClick={() => {
+                  setDeletePassword("");
+                  setDeleting(false);
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <p className="account-hint">
+              Signed in as <strong>{signedInAs}</strong>.{" "}
+              {syncState === "failed"
+                ? "Cannot reach the service right now, your work is safe on this device."
+                : syncState === "busy"
+                  ? "Syncing..."
+                  : "Your boards are kept in step across your devices."}
+            </p>
+            {status && <p className="account-status">{status}</p>}
+            <div className="account-actions">
+              <button className="btn btn-ghost" disabled={busy} onClick={onSignOut}>
+                Sign out
+              </button>
+              <button className="btn btn-ghost danger" disabled={busy} onClick={() => setDeleting(true)}>
+                Delete account
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="account-panel">
+      {mode === "verify" ? (
+        <p className="account-hint">
+          Enter the six digit code emailed to <strong>{email}</strong> to confirm the address. The
+          code lasts 15 minutes.
+        </p>
+      ) : mode === "forgot" ? (
+        <p className="account-hint">
+          We will email you a six digit code to set a new password.
+        </p>
+      ) : mode === "reset" ? (
+        <p className="account-hint">
+          Enter the code from the email and pick a new password.
+        </p>
+      ) : (
+        <p className="account-hint">
+          An account keeps your boards in step across your devices. Only the text is synced.
+        </p>
+      )}
+
+      {mode !== "verify" && (
+        <input
+          className="account-input"
+          type="email"
+          placeholder="Email address"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key !== "Enter" || busy || mode === "signup") return;
+            void submit();
+          }}
+        />
+      )}
+
+      {mode === "verify" && (
+        <input
+          autoFocus
+          className="account-input"
+          placeholder="Six digit code"
+          inputMode="numeric"
+          value={verifyToken}
+          onChange={(e) => setVerifyToken(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key !== "Enter" || busy) return;
+            void submit();
+          }}
+        />
+      )}
+
+      {mode === "reset" && (
+        <input
+          className="account-input"
+          placeholder="Six digit code"
+          inputMode="numeric"
+          value={resetToken}
+          onChange={(e) => setResetToken(e.target.value)}
+        />
+      )}
+
+      {(mode === "login" || mode === "signup" || mode === "reset") && (
+        <input
+          className="account-input"
+          type="password"
+          placeholder={mode === "reset" ? "New password" : "Password"}
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key !== "Enter" || busy || mode === "signup") return;
+            void submit();
+          }}
+        />
+      )}
+
+      {mode === "signup" && (
+        <input
+          className="account-input"
+          type="password"
+          placeholder="Retype the password"
+          value={confirmPassword}
+          onChange={(e) => setConfirmPassword(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key !== "Enter" || busy || password !== confirmPassword) return;
+            void submit();
+          }}
+        />
+      )}
+      {mode === "signup" && confirmPassword.length > 0 && password !== confirmPassword && (
+        <p className="account-hint">The passwords do not match.</p>
+      )}
+
+      <button
+        className="btn btn-accent"
+        disabled={busy || (mode === "signup" && password !== confirmPassword)}
+        onClick={() => void submit()}
+      >
+        {busy
+          ? "Working..."
+          : mode === "signup"
+            ? "Create Account"
+            : mode === "verify"
+              ? "Confirm the address"
+              : mode === "forgot"
+                ? "Email me a code"
+                : mode === "reset"
+                  ? "Set the password"
+                  : "Sign in"}
+      </button>
+
+      {notice && <p className="account-status">{notice}</p>}
+      {status && <p className="account-status">{status}</p>}
+
+      <div className="account-links">
+        {mode === "login" && (
+          <>
+            <button className="account-link" onClick={() => go("signup")}>
+              Create an account
+            </button>
+            <button className="account-link" onClick={() => go("forgot")}>
+              Forgot password
+            </button>
+          </>
+        )}
+        {mode !== "login" && (
+          <button className="account-link" onClick={() => go("login")}>
+            Back to sign in
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Rich text box for a note's details (bold, italic, strikethrough, code
+//    block, bullet and numbered lists). The box is uncontrolled: its HTML is
+//    set once on mount so typing never moves the caret. ──
+function RichEditor({
+  html,
+  onChange,
+  placeholder,
+}: {
+  html: string;
+  onChange: (html: string) => void;
+  placeholder: string;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [empty, setEmpty] = useState(() => bodyIsEmpty(html));
+  // Which buttons are lit for whatever the caret is currently sitting in.
+  const [on, setOn] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    if (ref.current) ref.current.innerHTML = bodyToHtml(html);
+    // Only on mount: re-setting the HTML while typing would jump the caret.
+  }, []);
+
+  const refreshState = useCallback(() => {
+    const box = ref.current;
+    if (!box) return;
+    const node = window.getSelection()?.anchorNode ?? null;
+    const anchor = node instanceof Element ? node : (node?.parentElement ?? null);
+    if (!anchor || !box.contains(anchor)) {
+      setOn({});
+      return;
+    }
+    setOn({
+      bold: document.queryCommandState("bold"),
+      italic: document.queryCommandState("italic"),
+      strikeThrough: document.queryCommandState("strikeThrough"),
+      insertUnorderedList: document.queryCommandState("insertUnorderedList"),
+      insertOrderedList: document.queryCommandState("insertOrderedList"),
+      pre: !!anchor.closest("pre"),
+    });
+  }, []);
+
+  useEffect(() => {
+    document.addEventListener("selectionchange", refreshState);
+    return () => document.removeEventListener("selectionchange", refreshState);
+  }, [refreshState]);
+
+  const sync = () => {
+    const el = ref.current;
+    if (!el) return;
+    onChange(el.innerHTML);
+    setEmpty(bodyIsEmpty(el.innerHTML));
+    refreshState();
+  };
+
+  const run = (cmd: string, value?: string) => {
+    ref.current?.focus();
+    document.execCommand(cmd, false, value);
+    sync();
+  };
+
+  // formatBlock toggles: a second click on an existing code block undoes it.
+  const codeBlock = () => {
+    ref.current?.focus();
+    const node = window.getSelection()?.anchorNode ?? null;
+    const el = node instanceof Element ? node : (node?.parentElement ?? null);
+    document.execCommand("formatBlock", false, el?.closest("pre") ? "div" : "pre");
+    sync();
+  };
+
+  // Paste as plain text so outside formatting never leaks in. Image pastes are
+  // left alone so the note editor's own handler can store them.
+  const onPaste = (e: ReactClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    const hasImage =
+      !!items &&
+      Array.from(items).some((i) => i.kind === "file" && i.type.startsWith("image/"));
+    if (hasImage) return;
+    e.preventDefault();
+    document.execCommand("insertText", false, e.clipboardData.getData("text/plain"));
+    sync();
+  };
+
+  const tool = (key: string, title: string, icon: ReactNode, onClick: () => void) => (
+    <button
+      type="button"
+      className={"rt-btn" + (on[key] ? " is-on" : "")}
+      title={title}
+      aria-pressed={!!on[key]}
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={onClick}
+    >
+      {icon}
+    </button>
+  );
+
+  const svg = (children: ReactNode) => (
+    <svg
+      width="17"
+      height="17"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {children}
+    </svg>
+  );
+
+  return (
+    <div className="rt-wrap">
+      <div className="rt-toolbar">
+        {tool(
+          "bold",
+          "Bold",
+          svg(<path d="M7 5h4.6a3.1 3.1 0 0 1 0 6.2H7zM7 11.2h5.2a3.4 3.4 0 0 1 0 6.8H7z" />),
+          () => run("bold")
+        )}
+        {tool("italic", "Italic", svg(<path d="M15 5h-4M13 19H9M14.5 5 10 19" />), () =>
+          run("italic")
+        )}
+        {tool(
+          "strikeThrough",
+          "Strikethrough",
+          svg(
+            <path d="M4 12h16M16.5 8.2C15.9 6.2 14.2 5 11.8 5 9.2 5 7.5 6.3 7.5 8.2c0 1.3.9 2.3 2.5 2.9M7.6 15.4c.5 2.1 2.4 3.4 4.8 3.4 2.7 0 4.5-1.3 4.5-3.3 0-.6-.1-1.1-.4-1.6" />
+          ),
+          () => run("strikeThrough")
+        )}
+        {tool("pre", "Code block", svg(<path d="m9 7-5 5 5 5M15 7l5 5-5 5" />), codeBlock)}
+        {tool(
+          "insertUnorderedList",
+          "Bullet list",
+          svg(
+            <>
+              <path d="M9 6h11M9 12h11M9 18h11" />
+              <circle cx="4.5" cy="6" r="1.3" fill="currentColor" stroke="none" />
+              <circle cx="4.5" cy="12" r="1.3" fill="currentColor" stroke="none" />
+              <circle cx="4.5" cy="18" r="1.3" fill="currentColor" stroke="none" />
+            </>
+          ),
+          () => run("insertUnorderedList")
+        )}
+        {tool(
+          "insertOrderedList",
+          "Numbered list",
+          svg(
+            <>
+              <path d="M9 6h11M9 12h11M9 18h11" />
+              <path
+                d="M3 4.6 4.3 4v4M3 10.6a1.3 1.3 0 1 1 2.2 1L3 14.6h2.4M3 16.4h2.2L3.9 18a1.3 1.3 0 1 1-.7 2.2"
+                strokeWidth="1.5"
+              />
+            </>
+          ),
+          () => run("insertOrderedList")
+        )}
+      </div>
+      <div
+        ref={ref}
+        className={"modal-body rt-editor" + (empty ? " is-empty" : "")}
+        contentEditable
+        suppressContentEditableWarning
+        data-placeholder={placeholder}
+        onInput={sync}
+        onBlur={sync}
+        onPaste={onPaste}
+      />
+    </div>
+  );
+}
+
 // ── Quick-add composer: a single line that expands to reveal a details
 //    field once you click into it (so people see details are possible). ──
 function Composer({ onAdd }: { onAdd: (title: string, body: string) => void }) {
@@ -2237,6 +3382,7 @@ function CardEditor({
   const [body, setBody] = useState(card.body);
   const [label, setLabel] = useState(card.label);
   const [images, setImages] = useState<string[]>(card.images);
+  const [files, setFiles] = useState<NoteFile[]>(card.files ?? []);
   const [imageMeta, setImageMeta] = useState<Record<string, { orig: number; size: number }>>(
     card.imageMeta ?? {}
   );
@@ -2244,6 +3390,14 @@ function CardEditor({
   const [coverY, setCoverY] = useState(card.coverY);
   const [coverZoom, setCoverZoom] = useState(card.coverZoom);
   const [showCover, setShowCover] = useState(false);
+  // Highlighted right after something is added, so the point lands then.
+  const [justAttached, setJustAttached] = useState(false);
+  const [attachError, setAttachError] = useState("");
+  // The PDF just attached, while we ask what to do with it.
+  const [pdfChoice, setPdfChoice] = useState<NoteFile | null>(null);
+  const [extracting, setExtracting] = useState(false);
+  // Bumped to remount the details box after text is added to it.
+  const [editorKey, setEditorKey] = useState(0);
   // Images pasted in THIS session (not yet saved). We keep each one's original
   // blob so its per-image "Compress" box can be ticked/unticked freely; the
   // compression is only committed to disk when the card is saved. Once a card is
@@ -2270,7 +3424,26 @@ function CardEditor({
     const wasEmpty = images.length === 0;
     let added = false;
     for (const item of Array.from(items)) {
-      if (item.kind === "file" && item.type.startsWith("image/")) {
+      if (item.kind !== "file") continue;
+      // A PDF copied in the file manager arrives here just like a screenshot.
+      if (item.type === "application/pdf") {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (!file) continue;
+        const name = `${uid()}.pdf`;
+        const label = file.name || "document.pdf";
+        try {
+          const b64 = await blobToBase64(file);
+          await invoke("put_file", { fileName: name, dataBase64: b64 });
+          setFiles((prev) => [...prev, { name, label }]);
+          setJustAttached(true);
+          setPdfChoice({ name, label });
+        } catch (err) {
+          setAttachError(err instanceof Error ? err.message : "Could not attach that PDF");
+        }
+        continue;
+      }
+      if (item.type.startsWith("image/")) {
         e.preventDefault();
         const file = item.getAsFile();
         if (!file) continue;
@@ -2285,12 +3458,13 @@ function CardEditor({
             [fileName]: { orig: file.size, size: file.size },
           }));
           added = true;
-        } catch {
-          // ignore a failed paste
+        } catch (err) {
+          setAttachError(err instanceof Error ? err.message : "Could not attach that image");
         }
       }
     }
     // First image on this note becomes the cover: let them frame it right away.
+    if (added) setJustAttached(true);
     if (wasEmpty && added) setShowCover(true);
   };
 
@@ -2308,6 +3482,80 @@ function CardEditor({
       return next;
     });
     invoke("delete_image", { fileName }).catch(() => {});
+  };
+
+  // ── Attached PDFs ──
+  const attachPdf = async () => {
+    try {
+      const picked = await open({
+        multiple: true,
+        filters: [{ name: "PDF", extensions: ["pdf"] }],
+      });
+      if (!picked) return;
+      const paths = Array.isArray(picked) ? picked : [picked];
+      let last: NoteFile | null = null;
+      for (const source of paths) {
+        if (typeof source !== "string") continue;
+        const label = source.split(/[\\/]/).pop() || "document.pdf";
+        const name = `${uid()}.pdf`;
+        try {
+          await invoke("attach_file", { source, fileName: name });
+          setFiles((prev) => [...prev, { name, label }]);
+          setJustAttached(true);
+          last = { name, label };
+        } catch (err) {
+          setAttachError(err instanceof Error ? err.message : "Could not attach that PDF");
+        }
+      }
+      if (last) setPdfChoice(last);
+    } catch {
+      // picker cancelled
+    }
+  };
+
+  const openPdf = async (name: string) => {
+    try {
+      const path = await invoke<string>("file_path", { fileName: name });
+      await openPath(path);
+    } catch (err) {
+      setAttachError(err instanceof Error ? err.message : "Could not open that PDF");
+    }
+  };
+
+  /** Pull the text out of an attached PDF and add it to the note's details. */
+  const extractPdfText = async (file: NoteFile) => {
+    setExtracting(true);
+    try {
+      const b64 = await invoke<string>("read_file", { fileName: file.name });
+      const text = await pdfToText(b64);
+      if (!text) {
+        setAttachError("No text found in that PDF. It may be a scan of a page.");
+        return;
+      }
+      const block =
+        `<div><strong>${file.label.replace(/[<>&]/g, "")}</strong></div>` +
+        text
+          .split("\n")
+          .map((line) =>
+            line.trim()
+              ? `<div>${line.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</div>`
+              : "<div><br></div>"
+          )
+          .join("");
+      setBody((prev) => (bodyIsEmpty(prev) ? block : bodyToHtml(prev) + "<div><br></div>" + block));
+      // The details box is uncontrolled, so remount it to show the new text.
+      setEditorKey((k) => k + 1);
+    } catch (err) {
+      setAttachError(err instanceof Error ? err.message : "Could not read that PDF");
+    } finally {
+      setExtracting(false);
+      setPdfChoice(null);
+    }
+  };
+
+  const removePdf = (name: string) => {
+    setFiles((prev) => prev.filter((f) => f.name !== name));
+    invoke("delete_file", { fileName: name }).catch(() => {});
   };
 
   // Make an image the card thumbnail by moving it to the front (images[0] = cover).
@@ -2386,22 +3634,29 @@ function CardEditor({
     }
   };
 
+  // Clicking the backdrop does nothing here on purpose: a note is closed with
+  // the X, Cancel or Escape, so a stray click never discards an edit.
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()} onPaste={handlePaste}>
-        <input
-          className="modal-title"
-          autoFocus
-          placeholder="Note title"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-        />
-        <textarea
-          className="modal-body"
+    <div className="modal-overlay">
+      <div className="modal" onPaste={handlePaste}>
+        <div className="modal-head">
+          <input
+            className="modal-title"
+            autoFocus
+            placeholder="Note title"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+          />
+          <button type="button" className="settings-close" title="Close" onClick={onClose}>
+            ✕
+          </button>
+        </div>
+        <div className="modal-scroll">
+        <RichEditor
+          key={editorKey}
+          html={body}
+          onChange={setBody}
           placeholder="Details (optional)"
-          value={body}
-          rows={images.length > 0 ? 6 : 12}
-          onChange={(e) => setBody(e.target.value)}
         />
         {images.length > 0 && (
           <>
@@ -2501,6 +3756,42 @@ function CardEditor({
         {images.length === 0 && (
           <span className="modal-hint">Paste an image (Ctrl+V) to attach it</span>
         )}
+        {files.length > 0 && (
+          <div className="pdf-list">
+            {files.map((f) => (
+              <div className="pdf-row" key={f.name}>
+                <button
+                  type="button"
+                  className="pdf-open"
+                  title="Open this PDF"
+                  onClick={() => openPdf(f.name)}
+                >
+                  <span className="pdf-tag">PDF</span>
+                  <span className="pdf-name">{f.label}</span>
+                </button>
+                <button
+                  type="button"
+                  className="pdf-remove"
+                  title="Remove this PDF"
+                  onClick={() => removePdf(f.name)}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <button type="button" className="btn btn-ghost adjust-cover-btn" onClick={attachPdf}>
+          <span aria-hidden="true">📎</span> Attach PDF
+        </button>
+        {attachError && <span className="attach-error">{attachError}</span>}
+        {(images.length > 0 || files.length > 0) && (
+          <span className={"local-only-note" + (justAttached ? " is-new" : "")}>
+            Images and PDFs stay on this device. Only your text is synced to your account, so they
+            will not appear on your other devices.
+          </span>
+        )}
+        </div>
         <div className="modal-field-row">
           <span className="label-caption">Label</span>
           <LabelDropdown
@@ -2552,8 +3843,9 @@ function CardEditor({
               onSave({
                 ...card,
                 title: title.trim(),
-                body: body.trim(),
+                body: bodyIsEmpty(body) ? "" : body,
                 label,
+                files,
                 images: finalImages,
                 imageMeta: finalMeta,
                 coverX,
@@ -2566,6 +3858,48 @@ function CardEditor({
           </button>
         </div>
       </div>
+      {pdfChoice && (
+        <div className="modal-overlay" onClick={(e) => e.stopPropagation()}>
+          <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+            <h2 className="settings-title">PDF attached</h2>
+            <p className="modal-text">
+              <strong>{pdfChoice.label}</strong> is attached to this note. Would you like its text
+              copied into the details as well?
+            </p>
+            <div className="pdf-choice">
+              <button
+                className="btn btn-accent"
+                disabled={extracting}
+                onClick={() => extractPdfText(pdfChoice)}
+              >
+                {extracting ? "Reading the PDF..." : "Extract text into the details"}
+              </button>
+              <button
+                className="btn btn-ghost"
+                disabled={extracting}
+                onClick={() => {
+                  openPdf(pdfChoice.name);
+                  setPdfChoice(null);
+                }}
+              >
+                Open File
+              </button>
+              <button
+                className="btn btn-ghost"
+                disabled={extracting}
+                onClick={() => setPdfChoice(null)}
+              >
+                Do nothing. Just attach the file to the note
+              </button>
+            </div>
+            <span className="modal-hint">
+              Whichever you pick the file stays attached, and clicking it opens it in your usual PDF
+              app.
+            </span>
+          </div>
+        </div>
+      )}
+
       {showCover && images.length > 0 && (
         <CoverAdjuster
           fileName={images[0]}
