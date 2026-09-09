@@ -319,32 +319,77 @@ fn usage() -> (String, String) {
     }
 }
 
-/// What the user's own data takes up: the board, its images and its PDFs. The
-/// webview's own cache folder is skipped, since Windows manages that, it dwarfs
-/// everything else, and the user cannot do anything about it.
+/// What the user's own data takes up, split the way the app thinks about it.
+/// All in bytes.
+#[derive(Serialize, Default)]
+struct CacheSize {
+    /// Everything below added together.
+    total: u64,
+    /// The board itself: every note's writing, titles, labels and layout.
+    notes: u64,
+    /// The images folder.
+    images: u64,
+    /// The files folder, which is PDFs.
+    pdfs: u64,
+    /// Settings, the sync details, and any parked conflict copies.
+    other: u64,
+}
+
+fn folder_size(p: &std::path::Path) -> u64 {
+    let mut total = 0;
+    if let Ok(rd) = std::fs::read_dir(p) {
+        for e in rd.filter_map(|e| e.ok()) {
+            let path = e.path();
+            if path.is_dir() {
+                total += folder_size(&path);
+            } else if let Ok(m) = e.metadata() {
+                total += m.len();
+            }
+        }
+    }
+    total
+}
+
+/// The board, its images and its PDFs, measured separately. The webview's own
+/// cache folder is skipped, since Windows manages that, it dwarfs everything
+/// else, and the user cannot do anything about it.
 #[tauri::command]
-fn cache_size(app: tauri::AppHandle) -> u64 {
-    fn walk(p: &std::path::Path) -> u64 {
-        let mut total = 0;
-        if let Ok(rd) = std::fs::read_dir(p) {
-            for e in rd.filter_map(|e| e.ok()) {
-                let path = e.path();
-                if path.is_dir() {
-                    if path.file_name().map_or(false, |n| n == "EBWebView") {
-                        continue;
-                    }
-                    total += walk(&path);
-                } else if let Ok(m) = e.metadata() {
-                    total += m.len();
+fn cache_size(app: tauri::AppHandle) -> CacheSize {
+    let dir = match app.path().app_data_dir() {
+        Ok(dir) => dir,
+        Err(_) => return CacheSize::default(),
+    };
+
+    let mut out = CacheSize {
+        notes: std::fs::metadata(dir.join("board.json"))
+            .map(|m| m.len())
+            .unwrap_or(0),
+        images: folder_size(&dir.join("images")),
+        pdfs: folder_size(&dir.join("files")),
+        ..Default::default()
+    };
+
+    // Whatever else the app has written, counted so the parts always add up to
+    // the figure in the footer.
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.filter_map(|e| e.ok()) {
+            let path = e.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.is_dir() {
+                if name == "EBWebView" || name == "images" || name == "files" {
+                    continue;
+                }
+                out.other += folder_size(&path);
+            } else if name != "board.json" {
+                if let Ok(m) = e.metadata() {
+                    out.other += m.len();
                 }
             }
         }
-        total
     }
-    match app.path().app_data_dir() {
-        Ok(dir) => walk(&dir),
-        Err(_) => 0,
-    }
+
+    out.total = out.notes + out.images + out.pdfs + out.other;
+    out
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

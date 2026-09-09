@@ -52,6 +52,18 @@ async function passwordKey(email: string, password: string): Promise<string> {
 // "bad app".
 const APP_NAME = "notestash";
 
+/** What the app's own files take up, split by what they are. Bytes. */
+type CacheSize = {
+  total: number;
+  notes: number;
+  images: number;
+  pdfs: number;
+  other: number;
+};
+
+/** One image waiting to be compressed: the smaller version, ready to write. */
+type CompressItem = { fileName: string; origSize: number; newSize: number; blob: Blob };
+
 /** Bytes as a short human figure, the same shape used across the apps. */
 function formatBytes(n: number): string {
   if (!n) return "0 KB";
@@ -577,7 +589,16 @@ export default function App() {
   const [usage, setUsage] = useState<{ cpu: string; ram: string }>({ cpu: "", ram: "" });
   // What this app's own files take up. Not polled: it only moves when something
   // is written, so it is read at startup and after each save.
-  const [cacheSize, setCacheSize] = useState("");
+  const [cache, setCache] = useState<CacheSize | null>(null);
+  // Every image that has never been compressed, already shrunk in memory so
+  // Settings can say how much room it would give back before anything is
+  // written. Worked out fresh each time Settings opens.
+  const [compressPlan, setCompressPlan] = useState<
+    "working" | { items: CompressItem[]; saved: number } | null
+  >(null);
+  const [compressing, setCompressing] = useState(false);
+  const compressRun = useRef(0);
+  const [showCache, setShowCache] = useState(false);
   const [sortMenu, setSortMenu] = useState(false);
   const [exportMenu, setExportMenu] = useState<{ x: number; y: number } | null>(null);
   const [dragBoardId, setDragBoardId] = useState<string | null>(null);
@@ -644,11 +665,16 @@ export default function App() {
 
   // ── How much room this app's own data takes ──
   const refreshCache = useCallback(() => {
-    invoke<number>("cache_size")
-      .then((n) => setCacheSize(formatBytes(n)))
+    invoke<CacheSize>("cache_size")
+      .then(setCache)
       .catch(() => {});
   }, []);
   useEffect(refreshCache, [refreshCache]);
+  useEffect(() => {
+    if (!showSettings) return;
+    refreshCache();
+    void planCompression();
+  }, [showSettings, refreshCache]);
 
   // ── Autosave (debounced) whenever the workspace changes ──
   useEffect(() => {
@@ -1468,6 +1494,88 @@ export default function App() {
     flash("All images deleted");
   };
 
+  // Which images have never been compressed, and what compressing them would
+  // save. Each one is actually shrunk here, in memory, since that is the only
+  // way to know the real figure; the result is kept so the button is instant.
+  const planCompression = async () => {
+    const run = ++compressRun.current;
+    const cards: Card[] = [];
+    for (const b of workspace.boards) for (const c of b.columns) cards.push(...c.cards);
+    for (const a of workspace.archived) cards.push(a.card);
+    const todo: string[] = [];
+    for (const cd of cards) {
+      for (const f of cd.images) {
+        const m = cd.imageMeta?.[f];
+        if (m && m.size < m.orig) continue; // shrunk already
+        todo.push(f);
+      }
+    }
+    if (todo.length === 0) {
+      setCompressPlan({ items: [], saved: 0 });
+      return;
+    }
+    setCompressPlan("working");
+    const items: CompressItem[] = [];
+    for (const fileName of todo) {
+      try {
+        const b64 = await invoke<string>("load_image", { fileName });
+        const blob = await (await fetch(`data:${mimeFromName(fileName)};base64,${b64}`)).blob();
+        const small = await compressImage(blob);
+        if (small.size < blob.size) {
+          items.push({ fileName, origSize: blob.size, newSize: small.size, blob: small });
+        }
+      } catch {
+        // an unreadable file is simply left out
+      }
+      if (run !== compressRun.current) return; // Settings closed and reopened
+    }
+    setCompressPlan({
+      items,
+      saved: items.reduce((sum, it) => sum + it.origSize - it.newSize, 0),
+    });
+  };
+
+  const compressAllImages = async () => {
+    if (!compressPlan || compressPlan === "working" || compressPlan.items.length === 0) return;
+    setCompressing(true);
+    const renamed = new Map<string, { to: string; orig: number; size: number }>();
+    for (const it of compressPlan.items) {
+      try {
+        const newName = `${uid()}.jpg`;
+        await invoke("save_image", { fileName: newName, dataBase64: await blobToBase64(it.blob) });
+        await invoke("delete_image", { fileName: it.fileName }).catch(() => {});
+        imageUrlCache.delete(it.fileName);
+        renamed.set(it.fileName, { to: newName, orig: it.origSize, size: it.newSize });
+      } catch {
+        // keep the original of anything that fails to write
+      }
+    }
+    const swap = (cd: Card): Card => {
+      if (!cd.images.some((f) => renamed.has(f))) return cd;
+      const meta = { ...(cd.imageMeta ?? {}) };
+      const images = cd.images.map((f) => {
+        const r = renamed.get(f);
+        if (!r) return f;
+        delete meta[f];
+        meta[r.to] = { orig: r.orig, size: r.size };
+        return r.to;
+      });
+      return { ...cd, images, imageMeta: meta };
+    };
+    setWorkspace((ws) => ({
+      ...ws,
+      boards: ws.boards.map((b) => ({
+        ...b,
+        columns: b.columns.map((c) => ({ ...c, cards: c.cards.map(swap) })),
+      })),
+      archived: ws.archived.map((a) => ({ ...a, card: swap(a.card) })),
+    }));
+    const saved = [...renamed.values()].reduce((sum, r) => sum + r.orig - r.size, 0);
+    setCompressPlan({ items: [], saved: 0 });
+    setCompressing(false);
+    flash(`${renamed.size} image${renamed.size === 1 ? "" : "s"} compressed, ${formatBytes(saved)} saved`);
+  };
+
   const deleteEverything = async () => {
     if (
       !(await confirmDelete(
@@ -2277,7 +2385,17 @@ export default function App() {
               <span className="sep">|</span>
               <span className="footer-version">RAM: {usage.ram || "..."}</span>
               <span className="sep">|</span>
-              <span className="footer-version">Cache: {cacheSize || "..."}</span>
+              <button
+                type="button"
+                className="footer-version cache-btn"
+                title="What is taking up the room"
+                onClick={() => {
+                  refreshCache();
+                  setShowCache(true);
+                }}
+              >
+                Cache: {cache ? formatBytes(cache.total) : "..."}
+              </button>
             </>
           )}
         </div>
@@ -2315,6 +2433,33 @@ export default function App() {
           </svg>
           <span>Column</span>
         </button>
+      )}
+
+      {showCache && cache && (
+        <div className="modal-overlay" onClick={() => setShowCache(false)}>
+          <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="settings-head">
+              <h2 className="settings-title">What is taking up the room</h2>
+              <span className="settings-control">
+                <button
+                  type="button"
+                  className="settings-close"
+                  title="Close"
+                  onClick={() => setShowCache(false)}
+                >
+                  <CloseIcon />
+                </button>
+              </span>
+            </div>
+            <CacheBreakdown cache={cache} />
+            <div className="modal-actions">
+              <div className="spacer" />
+              <button className="btn btn-accent" onClick={() => setShowCache(false)}>
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {showSettings && (
@@ -2374,6 +2519,42 @@ export default function App() {
                     }}
                   >
                     Import
+                  </button>
+                </span>
+              </div>
+            </div>
+            <div className="settings-section">
+              <h3 className="settings-section-title">Cache</h3>
+              {cache ? (
+                <CacheBreakdown cache={cache} />
+              ) : (
+                <p className="account-hint">Working it out...</p>
+              )}
+              <div className="settings-row compress-row">
+                <span className="settings-text">
+                  <span className="settings-label">Compress all images</span>
+                  <span className="settings-hint">
+                    {compressPlan === null || compressPlan === "working"
+                      ? "Working out what it would save..."
+                      : compressPlan.items.length === 0
+                        ? "Every image is already compressed"
+                        : `${compressPlan.items.length} image${
+                            compressPlan.items.length === 1 ? "" : "s"
+                          } could be smaller, saving ${formatBytes(compressPlan.saved)}`}
+                  </span>
+                </span>
+                <span className="settings-control">
+                  <button
+                    className="btn btn-ghost settings-btn"
+                    disabled={
+                      compressing ||
+                      compressPlan === null ||
+                      compressPlan === "working" ||
+                      compressPlan.items.length === 0
+                    }
+                    onClick={() => void compressAllImages()}
+                  >
+                    {compressing ? "Working..." : "Compress"}
                   </button>
                 </span>
               </div>
@@ -2902,6 +3083,75 @@ function LabelDropdown({
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+// ── The room the app's own files take up, as one bar split by what they are,
+//    the way a phone shows its storage. The list under it carries the same
+//    colours with the figures, so the bar never has to be read on its own. ──
+const CACHE_PARTS = [
+  { key: "notes", label: "Notes", hint: "Titles, writing, labels and layout" },
+  { key: "images", label: "Images", hint: "Pictures pasted into notes" },
+  { key: "pdfs", label: "PDFs", hint: "Files attached to notes" },
+  { key: "other", label: "Other", hint: "Settings, sign-in details and backups" },
+] as const;
+
+function CacheBreakdown({ cache }: { cache: CacheSize }) {
+  const parts = CACHE_PARTS.map((p) => ({ ...p, bytes: cache[p.key] })).filter(
+    (p) => p.bytes > 0
+  );
+
+  if (!cache.total) {
+    return (
+      <p className="account-hint">
+        Nothing stored yet. Notes, images and PDFs you add will show up here.
+      </p>
+    );
+  }
+
+  return (
+    <div className="cache-panel">
+      <p className="cache-total">
+        {formatBytes(cache.total)} <span>on this computer</span>
+      </p>
+      <div
+        className="cache-bar"
+        role="img"
+        aria-label={parts
+          .map((p) => `${p.label} ${formatBytes(p.bytes)}`)
+          .join(", ")}
+      >
+        {parts.map((p) => (
+          <span
+            key={p.key}
+            className={"cache-slice is-" + p.key}
+            // Every slice stays wide enough to see, however small the share.
+            style={{ flexGrow: Math.max(p.bytes / cache.total, 0.02) }}
+          />
+        ))}
+      </div>
+      <ul className="cache-list">
+        {CACHE_PARTS.map((p) => (
+          <li key={p.key}>
+            <span className={"cache-dot is-" + p.key} aria-hidden="true" />
+            <span className="cache-name">
+              {p.label}
+              <span className="cache-hint">{p.hint}</span>
+            </span>
+            <span className="cache-figure">
+              {formatBytes(cache[p.key])}
+              <span className="cache-share">
+                {Math.round((cache[p.key] / cache.total) * 100)}%
+              </span>
+            </span>
+          </li>
+        ))}
+      </ul>
+      <p className="account-hint">
+        The web browser Windows lends this app keeps a cache of its own. That one
+        is not counted here: Windows clears it by itself.
+      </p>
     </div>
   );
 }
@@ -3606,6 +3856,9 @@ function CardEditor({
             ...prev,
             [fileName]: { orig: file.size, size: file.size },
           }));
+          // Ticked from the start: a full size screenshot is several hundred
+          // times the writing beside it. Untick it to keep the original.
+          void toggleImageCompress(fileName, true);
           added = true;
         } catch (err) {
           setAttachError(err instanceof Error ? err.message : "Could not attach that image");
@@ -3772,11 +4025,23 @@ function CardEditor({
   const toggleImageCompress = async (fileName: string, checked: boolean) => {
     setCompressPick((prev) => ({ ...prev, [fileName]: checked }));
     if (!checked) return;
-    const sess = sessionImages.current.get(fileName);
-    if (!sess || sess.compressed) return;
     try {
-      const c = await compressImage(sess.origBlob);
-      sess.compressed = { blob: c, size: c.size };
+      let sess = sessionImages.current.get(fileName);
+      // An image saved on an earlier visit has no blob in hand, so read the one
+      // on disk. That is what gets compressed, and what its saving is measured
+      // against.
+      if (!sess) {
+        const b64 = await invoke<string>("load_image", { fileName });
+        const blob = await (
+          await fetch(`data:${mimeFromName(fileName)};base64,${b64}`)
+        ).blob();
+        sess = { origBlob: blob, origSize: blob.size };
+        sessionImages.current.set(fileName, sess);
+      }
+      if (!sess.compressed) {
+        const c = await compressImage(sess.origBlob);
+        sess.compressed = { blob: c, size: c.size };
+      }
       setCompressPick((prev) => ({ ...prev })); // re-render to show the projected size
     } catch {
       // leave it as original if compression fails
@@ -3807,6 +4072,9 @@ function CardEditor({
           onChange={setBody}
           placeholder="Details (optional)"
         />
+        {/* Pictures on the left, their controls in the space beside them. */}
+        <div className="modal-media">
+          <div className="modal-media-main">
         {images.length > 0 && (
           <>
             <div className="modal-images">
@@ -3825,6 +4093,8 @@ function CardEditor({
                   : meta && meta.size < meta.orig
                     ? meta.size
                     : null;
+                // Already shrunk on an earlier save: nothing left to offer.
+                const alreadySmaller = !sess && !!meta && meta.size < meta.orig;
                 return (
                   <div
                     className={"modal-image" + (isCover ? " is-cover" : "")}
@@ -3837,7 +4107,19 @@ function CardEditor({
                     }
                   >
                     <NoteImage fileName={fileName} className="modal-image-img" />
-                    {isCover && <span className="cover-badge">Card thumbnail</span>}
+                    {isCover && (
+                      <button
+                        type="button"
+                        className="cover-badge"
+                        title="Adjust how this sits on the card"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setShowCover(true);
+                        }}
+                      >
+                        Card thumbnail
+                      </button>
+                    )}
                     {!isCover && <span className="set-cover-hint">Set as thumbnail</span>}
                     <button
                       type="button"
@@ -3851,7 +4133,10 @@ function CardEditor({
                       ✕
                     </button>
                     <div className="modal-image-sizes">
-                      {sess && (
+                      {/* Hidden only once an image has actually been shrunk:
+                          running it through a second time costs quality and
+                          saves almost nothing. */}
+                      {!alreadySmaller && (
                         <label
                           className="img-compress"
                           onClick={(e) => e.stopPropagation()}
@@ -3893,18 +4178,37 @@ function CardEditor({
                 );
               })}
             </div>
-            <button
-              type="button"
-              className="btn btn-ghost adjust-cover-btn"
-              onClick={() => setShowCover(true)}
-            >
-              <span aria-hidden="true">◱</span> Adjust card thumbnail
-            </button>
           </>
         )}
         {images.length === 0 && (
           <span className="modal-hint">Paste an image (Ctrl+V) to attach it</span>
         )}
+          </div>
+          <div className="modal-media-side">
+            <div className="modal-media-actions">
+              {images.length > 0 && (
+                <button
+                  type="button"
+                  className="btn btn-ghost adjust-cover-btn"
+                  onClick={() => setShowCover(true)}
+                >
+                  <span aria-hidden="true">◱</span> Adjust card thumbnail
+                </button>
+              )}
+              <button type="button" className="btn btn-ghost adjust-cover-btn" onClick={attachPdf}>
+                <span aria-hidden="true">📎</span> Attach PDF
+              </button>
+            </div>
+            <div className="modal-field-row">
+              <span className="label-caption">Label</span>
+              <LabelDropdown
+                labels={labels}
+                currentLabel={label}
+                onAssign={setLabel}
+                onRename={onRenameLabel}
+                direction="up"
+              />
+            </div>
         {files.length > 0 && (
           <div className="pdf-list">
             {files.map((f) => (
@@ -3930,26 +4234,15 @@ function CardEditor({
             ))}
           </div>
         )}
-        <button type="button" className="btn btn-ghost adjust-cover-btn" onClick={attachPdf}>
-          <span aria-hidden="true">📎</span> Attach PDF
-        </button>
         {attachError && <span className="attach-error">{attachError}</span>}
-        {(images.length > 0 || files.length > 0) && (
-          <span className={"local-only-note" + (justAttached ? " is-new" : "")}>
-            Images and PDFs stay on this device. Only your text is synced to your account, so they
-            will not appear on your other devices.
-          </span>
-        )}
+            {(images.length > 0 || files.length > 0) && (
+              <span className={"local-only-note" + (justAttached ? " is-new" : "")}>
+                Images and PDFs stay on this device. Only your text is synced to your account, so
+                they will not appear on your other devices.
+              </span>
+            )}
+          </div>
         </div>
-        <div className="modal-field-row">
-          <span className="label-caption">Label</span>
-          <LabelDropdown
-            labels={labels}
-            currentLabel={label}
-            onAssign={setLabel}
-            onRename={onRenameLabel}
-            direction="up"
-          />
         </div>
         <div className="modal-actions">
           <button className="btn btn-danger" onClick={onDelete}>Delete</button>
