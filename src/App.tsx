@@ -47,6 +47,18 @@ async function passwordKey(email: string, password: string): Promise<string> {
   return btoa(raw);
 }
 
+// The app name goes on every account route, so it is added here rather than at
+// the six call sites: written by hand, some get left out and the server answers
+// "bad app".
+const APP_NAME = "notestash";
+
+/** Bytes as a short human figure, the same shape used across the apps. */
+function formatBytes(n: number): string {
+  if (!n) return "0 KB";
+  if (n < 1024 * 1024) return Math.max(1, Math.round(n / 1024)) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
+}
+
 async function accountCall(
   action: string,
   body: Record<string, unknown>
@@ -54,7 +66,7 @@ async function accountCall(
   const res = await fetch(`${ACCOUNT_URL}/${action}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ app: APP_NAME, ...body }),
   });
   const data = (await res.json().catch(() => ({}))) as {
     code?: string;
@@ -563,6 +575,9 @@ export default function App() {
     () => localStorage.getItem("notestash.defaultColumns") !== "0"
   );
   const [usage, setUsage] = useState<{ cpu: string; ram: string }>({ cpu: "", ram: "" });
+  // What this app's own files take up. Not polled: it only moves when something
+  // is written, so it is read at startup and after each save.
+  const [cacheSize, setCacheSize] = useState("");
   const [sortMenu, setSortMenu] = useState(false);
   const [exportMenu, setExportMenu] = useState<{ x: number; y: number } | null>(null);
   const [dragBoardId, setDragBoardId] = useState<string | null>(null);
@@ -580,6 +595,7 @@ export default function App() {
   const [dragGhost, setDragGhost] = useState<{ x: number; y: number; width: number } | null>(null);
   const [colDrag, setColDrag] = useState<ColDrag | null>(null);
   const [status, setStatus] = useState<string>("");
+  const [statusBad, setStatusBad] = useState(false);
 
   // ── Account sync ──
   const [syncCode, setSyncCode] = useState("");
@@ -626,14 +642,26 @@ export default function App() {
     })();
   }, []);
 
+  // ── How much room this app's own data takes ──
+  const refreshCache = useCallback(() => {
+    invoke<number>("cache_size")
+      .then((n) => setCacheSize(formatBytes(n)))
+      .catch(() => {});
+  }, []);
+  useEffect(refreshCache, [refreshCache]);
+
   // ── Autosave (debounced) whenever the workspace changes ──
   useEffect(() => {
     if (!loadedRef.current) return;
     const t = setTimeout(() => {
-      invoke("save_board", { data: JSON.stringify(workspace) }).catch(() => {});
+      // Images and PDFs are written elsewhere, but attaching one also changes
+      // the board, so this one place covers every write.
+      invoke("save_board", { data: JSON.stringify(workspace) })
+        .then(refreshCache)
+        .catch(() => {});
     }, 300);
     return () => clearTimeout(t);
-  }, [workspace]);
+  }, [workspace, refreshCache]);
 
   // ── Remember small UI preferences across restarts ──
   useEffect(() => {
@@ -686,9 +714,12 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [cardMenu]);
 
-  const flash = useCallback((msg: string) => {
+  // Second argument marks a failure, which is shown in red with a cross rather
+  // than green with a tick. Failures stay up longer: they are worth reading.
+  const flash = useCallback((msg: string, bad = false) => {
     setStatus(msg);
-    window.setTimeout(() => setStatus(""), 2200);
+    setStatusBad(bad);
+    window.setTimeout(() => setStatus(""), bad ? 6000 : 2200);
   }, []);
 
   // ── Sync: push and pull the board's text ──
@@ -834,11 +865,11 @@ export default function App() {
   ): Promise<boolean | "verify"> => {
     const address = email.trim().toLowerCase();
     if (!address.includes("@") || !address.includes(".")) {
-      flash("That email address does not look right");
+      flash("That email address does not look right", true);
       return false;
     }
     if (password.length < 8) {
-      flash("Use at least 8 characters for the password");
+      flash("Use at least 8 characters for the password", true);
       return false;
     }
     setAccountBusy(true);
@@ -846,7 +877,6 @@ export default function App() {
       const { code } = await accountCall(action, {
         email: address,
         key: await passwordKey(address, password),
-        app: "notestash",
       });
       if (action === "signup") {
         flash("Check your email for a code to confirm this address");
@@ -861,10 +891,10 @@ export default function App() {
       return true;
     } catch (e) {
       if ((e as Error & { needsVerify?: boolean }).needsVerify) {
-        flash(e instanceof Error ? e.message : "Verify the address first");
+        flash(e instanceof Error ? e.message : "Verify the address first", true);
         return "verify";
       }
-      flash(e instanceof Error ? e.message : "Could not reach the sync service");
+      flash(e instanceof Error ? e.message : "Could not reach the sync service", true);
       return false;
     } finally {
       setAccountBusy(false);
@@ -874,12 +904,15 @@ export default function App() {
   const verifyAccount = async (email: string, token: string) => {
     const address = email.trim().toLowerCase();
     if (!/^[0-9]{6}$/.test(token.trim())) {
-      flash("The code from the email is six digits");
+      flash("The code from the email is six digits", true);
       return false;
     }
     setAccountBusy(true);
     try {
-      const { code } = await accountCall("verify", { email: address, token: token.trim() });
+      const { code } = await accountCall("verify", {
+        email: address,
+        token: token.trim(),
+      });
       if (!code) throw new Error("The service sent nothing back");
       await invoke("set_sync_code", { code });
       await invoke("set_sync_email", { email: address });
@@ -888,7 +921,28 @@ export default function App() {
       flash("Address confirmed, sync on");
       return true;
     } catch (e) {
-      flash(e instanceof Error ? e.message : "Could not reach the sync service");
+      flash(e instanceof Error ? e.message : "Could not reach the sync service", true);
+      return false;
+    } finally {
+      setAccountBusy(false);
+    }
+  };
+
+  // Sends another confirmation code. The service answers the same whether the
+  // address is waiting, already confirmed or unknown, so the wording here has
+  // to be just as careful.
+  const resendCode = async (email: string) => {
+    const address = email.trim().toLowerCase();
+    if (!address.includes("@") || !address.includes(".")) {
+      flash("That email address does not look right", true);
+      return false;
+    }
+    setAccountBusy(true);
+    try {
+      await accountCall("resend", { email: address });
+      return true;
+    } catch (e) {
+      flash(e instanceof Error ? e.message : "Could not reach the sync service", true);
       return false;
     } finally {
       setAccountBusy(false);
@@ -898,16 +952,16 @@ export default function App() {
   const forgotPassword = async (email: string) => {
     const address = email.trim().toLowerCase();
     if (!address.includes("@")) {
-      flash("That email address does not look right");
+      flash("That email address does not look right", true);
       return false;
     }
     setAccountBusy(true);
     try {
-      await accountCall("forgot", { email: address, app: "notestash" });
+      await accountCall("forgot", { email: address });
       flash("If that address has an account, a code is on its way");
       return true;
     } catch (e) {
-      flash(e instanceof Error ? e.message : "Could not reach the sync service");
+      flash(e instanceof Error ? e.message : "Could not reach the sync service", true);
       return false;
     } finally {
       setAccountBusy(false);
@@ -917,11 +971,11 @@ export default function App() {
   const resetPassword = async (email: string, token: string, password: string) => {
     const address = email.trim().toLowerCase();
     if (!/^[0-9]{6}$/.test(token.trim())) {
-      flash("The code from the email is six digits");
+      flash("The code from the email is six digits", true);
       return false;
     }
     if (password.length < 8) {
-      flash("Use at least 8 characters for the password");
+      flash("Use at least 8 characters for the password", true);
       return false;
     }
     setAccountBusy(true);
@@ -939,7 +993,7 @@ export default function App() {
       flash("Password set, sync on");
       return true;
     } catch (e) {
-      flash(e instanceof Error ? e.message : "Could not reach the sync service");
+      flash(e instanceof Error ? e.message : "Could not reach the sync service", true);
       return false;
     } finally {
       setAccountBusy(false);
@@ -967,7 +1021,7 @@ export default function App() {
   const deleteAccount = (password: string) => {
     if (!syncEmail) return;
     if (password.length < 8) {
-      flash("Type your password to confirm");
+      flash("Type your password to confirm", true);
       return;
     }
     void (async () => {
@@ -991,7 +1045,7 @@ export default function App() {
         serverStampRef.current = 0;
         flash("Account deleted");
       } catch (e) {
-        flash(e instanceof Error ? e.message : "Could not reach the sync service");
+        flash(e instanceof Error ? e.message : "Could not reach the sync service", true);
       } finally {
         setAccountBusy(false);
       }
@@ -1080,7 +1134,7 @@ export default function App() {
 
   const deleteBoard = async (id: string) => {
     if (workspace.boards.length <= 1) {
-      flash("Can't delete your only board");
+      flash("Can't delete your only board", true);
       return;
     }
     const b = workspace.boards.find((x) => x.id === id);
@@ -1683,7 +1737,7 @@ export default function App() {
       await invoke("export_board", { path, data: JSON.stringify(workspace, null, 2) });
       flash("Backup exported");
     } catch {
-      flash("Export failed");
+      flash("Export failed", true);
     }
   };
 
@@ -1705,7 +1759,7 @@ export default function App() {
       await invoke("export_board", { path, data: JSON.stringify(one, null, 2) });
       flash("Board exported");
     } catch {
-      flash("Export failed");
+      flash("Export failed", true);
     }
   };
 
@@ -1752,7 +1806,7 @@ export default function App() {
       setWorkspace(normalizeWorkspace(JSON.parse(text)));
       flash("Backup imported");
     } catch {
-      flash("Import failed - not a valid backup file");
+      flash("Import failed - not a valid backup file", true);
     }
   };
 
@@ -1836,7 +1890,9 @@ export default function App() {
         </div>
 
         <div className="topbar-actions">
-          {status && <span className="status">{status}</span>}
+          {status && (
+            <span className={"status" + (statusBad ? " bad" : "")}>{status}</span>
+          )}
           <select
             className="view-select"
             value={cardView}
@@ -2220,6 +2276,8 @@ export default function App() {
               <span className="footer-version">CPU: {usage.cpu || "..."}</span>
               <span className="sep">|</span>
               <span className="footer-version">RAM: {usage.ram || "..."}</span>
+              <span className="sep">|</span>
+              <span className="footer-version">Cache: {cacheSize || "..."}</span>
             </>
           )}
         </div>
@@ -2271,14 +2329,14 @@ export default function App() {
                   title="Close"
                   onClick={() => setShowSettings(false)}
                 >
-                  ✕
+                  <CloseIcon />
                 </button>
               </span>
             </div>
             <div className="settings-list">
               <label className="settings-row">
                 <span className="settings-text">
-                  <span className="settings-label">Show CPU + Memory usage</span>
+                  <span className="settings-label">Show CPU, memory and cache</span>
                   <span className="settings-hint">In the footer, for NoteStash only</span>
                 </span>
                 <span className="settings-control">
@@ -2327,8 +2385,10 @@ export default function App() {
                 syncState={syncState}
                 busy={accountBusy}
                 status={status}
+                statusBad={statusBad}
                 onUseAccount={useAccount}
                 onVerify={verifyAccount}
+                onResend={resendCode}
                 onForgot={forgotPassword}
                 onReset={resetPassword}
                 onSignOut={signOut}
@@ -2846,6 +2906,25 @@ function LabelDropdown({
   );
 }
 
+// ── The close cross. Drawn, not typed: the ✕ character carries uneven side
+//    bearings, so it never sat in the middle of its button. ──
+function CloseIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.4"
+      strokeLinecap="round"
+      aria-hidden="true"
+    >
+      <path d="M6 6 18 18M18 6 6 18" />
+    </svg>
+  );
+}
+
 // ── The account panel inside Settings. One panel, six states. There is no
 //    sync code anywhere in here: signing in fetches it and nothing shows it. ──
 function AccountPanel({
@@ -2853,8 +2932,10 @@ function AccountPanel({
   syncState,
   busy,
   status,
+  statusBad,
   onUseAccount,
   onVerify,
+  onResend,
   onForgot,
   onReset,
   onSignOut,
@@ -2864,12 +2945,14 @@ function AccountPanel({
   syncState: "off" | "idle" | "busy" | "failed";
   busy: boolean;
   status: string;
+  statusBad: boolean;
   onUseAccount: (
     action: "signup" | "login",
     email: string,
     password: string
   ) => Promise<boolean | "verify">;
   onVerify: (email: string, token: string) => Promise<boolean>;
+  onResend: (email: string) => Promise<boolean>;
   onForgot: (email: string) => Promise<boolean>;
   onReset: (email: string, token: string, password: string) => Promise<boolean>;
   onSignOut: () => void;
@@ -2883,6 +2966,9 @@ function AccountPanel({
   const [verifyToken, setVerifyToken] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [deletePassword, setDeletePassword] = useState("");
+  // Set when the confirm box is opened from the sign in screen with no address
+  // typed, so the box asks for the address as well as the code.
+  const [needEmail, setNeedEmail] = useState(false);
   // Stays put until the next step, unlike the top bar's passing message.
   const [notice, setNotice] = useState("");
 
@@ -2896,6 +2982,7 @@ function AccountPanel({
   const go = (next: typeof mode, message = "") => {
     clearAccountForm();
     setNotice(message);
+    setNeedEmail(false);
     setMode(next);
   };
 
@@ -2978,7 +3065,14 @@ function AccountPanel({
                   ? "Syncing..."
                   : "Your boards are kept in step across your devices."}
             </p>
-            {status && <p className="account-status">{status}</p>}
+            {status && (
+              <p
+                className={"account-status" + (statusBad ? " bad" : "")}
+                role={statusBad ? "alert" : "status"}
+              >
+                {status}
+              </p>
+            )}
             <div className="account-actions">
               <button className="btn btn-ghost" disabled={busy} onClick={onSignOut}>
                 Sign out
@@ -2996,10 +3090,17 @@ function AccountPanel({
   return (
     <div className="account-panel">
       {mode === "verify" ? (
-        <p className="account-hint">
-          Enter the six digit code emailed to <strong>{email}</strong> to confirm the address. The
-          code lasts 15 minutes.
-        </p>
+        needEmail ? (
+          <p className="account-hint">
+            Type the address you signed up with and the six digit code from the email. A code lasts
+            15 minutes.
+          </p>
+        ) : (
+          <p className="account-hint">
+            Enter the six digit code emailed to <strong>{email}</strong> to confirm the address. The
+            code lasts 15 minutes.
+          </p>
+        )
       ) : mode === "forgot" ? (
         <p className="account-hint">
           We will email you a six digit code to set a new password.
@@ -3014,8 +3115,9 @@ function AccountPanel({
         </p>
       )}
 
-      {mode !== "verify" && (
+      {(mode !== "verify" || needEmail) && (
         <input
+          autoFocus={mode === "verify"}
           className="account-input"
           type="email"
           placeholder="Email address"
@@ -3030,7 +3132,7 @@ function AccountPanel({
 
       {mode === "verify" && (
         <input
-          autoFocus
+          autoFocus={!needEmail}
           className="account-input"
           placeholder="Six digit code"
           inputMode="numeric"
@@ -3102,18 +3204,65 @@ function AccountPanel({
                   : "Sign in"}
       </button>
 
-      {notice && <p className="account-status">{notice}</p>}
-      {status && <p className="account-status">{status}</p>}
+      {notice && (
+        <p className="account-status" role="status">
+          {notice}
+        </p>
+      )}
+      {status && (
+        <p
+          className={"account-status" + (statusBad ? " bad" : "")}
+          role={statusBad ? "alert" : "status"}
+        >
+          {status}
+        </p>
+      )}
 
       <div className="account-links">
         {mode === "login" && (
           <>
             <button className="account-link" onClick={() => go("signup")}>
-              Create an account
+              Create Account
             </button>
+            <span className="account-sep" aria-hidden="true">
+              |
+            </span>
             <button className="account-link" onClick={() => go("forgot")}>
-              Forgot password
+              Forgot Password
             </button>
+            <span className="account-sep" aria-hidden="true">
+              |
+            </span>
+            <button
+              className="account-link"
+              onClick={() => {
+                clearAccountForm();
+                setNotice("");
+                setNeedEmail(!email.trim());
+                setMode("verify");
+              }}
+            >
+              Verify Email
+            </button>
+          </>
+        )}
+        {mode === "verify" && (
+          <>
+            <button
+              className="account-link"
+              disabled={busy}
+              onClick={async () => {
+                if (!(await onResend(email))) return;
+                setNotice(
+                  "If that address is waiting to be confirmed, a new six digit code is on its way. It lasts 15 minutes, and any earlier code stops working."
+                );
+              }}
+            >
+              Resend Verification Code
+            </button>
+            <span className="account-sep" aria-hidden="true">
+              |
+            </span>
           </>
         )}
         {mode !== "login" && (
@@ -3648,7 +3797,7 @@ function CardEditor({
             onChange={(e) => setTitle(e.target.value)}
           />
           <button type="button" className="settings-close" title="Close" onClick={onClose}>
-            ✕
+            <CloseIcon />
           </button>
         </div>
         <div className="modal-scroll">

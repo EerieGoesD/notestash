@@ -11,6 +11,8 @@
   --accent-h: #818cf8;
   --danger:   #ef4444;
   --danger-h: #f87171;
+  --success:  #22c55e;
+  --success-h: #4ade80;
   --warning:  #eab308;
   --coffee:   #facc15;
   --coffee-h: #f0d060;
@@ -30,6 +32,8 @@
   --accent-h: #4f46e5;
   --danger:   #ef4444;
   --danger-h: #dc2626;
+  --success:  #16a34a;
+  --success-h: #15803d;
   --warning:  #ca9a04;
   --coffee:   #b45309;
   --coffee-h: #92400e;
@@ -166,6 +170,7 @@ body {
   color: var(--text-dim);
   font-family: var(--mono);
 }
+.status.bad { color: var(--danger-h); }
 .view-select {
   padding: 7px 30px 7px 12px;
   background: var(--surface2)
@@ -740,6 +745,11 @@ body {
   cursor: pointer;
   transition: background 0.12s, color 0.12s, border-color 0.12s;
 }
+.settings-close svg { display: block; }
+/* The cross sits in the middle of a 29px button, the tick boxes are 15px, so
+   right edges alone leave the cross 7px inside the tick line. Push it out by
+   half the difference and the cross lands on the same line as the ticks. */
+.settings-head .settings-close { margin-right: -7px; border-radius: var(--radius); }
 .settings-close:hover { background: var(--surface2); color: var(--text); border-color: var(--accent); }
 .settings-title {
   margin: 0;
@@ -912,15 +922,48 @@ label.settings-row { cursor: pointer; }
    and changes only the colour. */
 .btn-ghost.danger { color: var(--danger-h); border-color: rgba(239, 68, 68, 0.4); }
 .btn-ghost.danger:hover { background: var(--danger); color: #fff; border-color: var(--danger); }
+/* A status message, not a link: its own colour, a tick, and a tinted panel, so
+   it never reads as something to click and does not rely on colour alone. */
 .account-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
   margin: 0;
+  padding: 9px 11px;
   font-size: 12px;
   line-height: 1.45;
-  color: var(--accent-h);
-  border-left: 2px solid var(--accent);
-  padding-left: 9px;
+  color: var(--success-h);
+  background: rgba(34, 197, 94, 0.1);
+  border: 1px solid rgba(34, 197, 94, 0.35);
+  border-radius: 8px;
 }
-.account-links { display: flex; gap: 12px; flex-wrap: wrap; }
+.account-status::before {
+  content: "✓";
+  flex-shrink: 0;
+  font-weight: 700;
+  line-height: 1.45;
+}
+:root[data-theme="light"] .account-status {
+  color: var(--success-h);
+  background: rgba(22, 163, 74, 0.1);
+  border-color: rgba(22, 163, 74, 0.35);
+}
+/* Something failed: red panel, and a cross instead of the tick, so the two are
+   told apart without reading the colour. */
+.account-status.bad {
+  color: var(--danger-h);
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.4);
+}
+.account-status.bad::before { content: "✕"; }
+:root[data-theme="light"] .account-status.bad {
+  color: var(--danger-h);
+  background: rgba(220, 38, 38, 0.1);
+  border-color: rgba(220, 38, 38, 0.4);
+}
+.account-links { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.account-sep { color: var(--border); font-size: 12px; user-select: none; }
+/* Underlined, so it is recognisable as a link without depending on colour. */
 .account-link {
   background: none;
   border: none;
@@ -928,9 +971,11 @@ label.settings-row { cursor: pointer; }
   color: var(--accent-h);
   font-family: var(--font);
   font-size: 12px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
   cursor: pointer;
 }
-.account-link:hover { text-decoration: underline; }
+.account-link:hover { color: var(--accent); }
 .modal-text { margin: 0; font-size: 13px; line-height: 1.55; color: var(--text); }
 .local-only-note {
   font-size: 11.5px;

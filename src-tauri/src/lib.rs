@@ -319,6 +319,34 @@ fn usage() -> (String, String) {
     }
 }
 
+/// What the user's own data takes up: the board, its images and its PDFs. The
+/// webview's own cache folder is skipped, since Windows manages that, it dwarfs
+/// everything else, and the user cannot do anything about it.
+#[tauri::command]
+fn cache_size(app: tauri::AppHandle) -> u64 {
+    fn walk(p: &std::path::Path) -> u64 {
+        let mut total = 0;
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.filter_map(|e| e.ok()) {
+                let path = e.path();
+                if path.is_dir() {
+                    if path.file_name().map_or(false, |n| n == "EBWebView") {
+                        continue;
+                    }
+                    total += walk(&path);
+                } else if let Ok(m) = e.metadata() {
+                    total += m.len();
+                }
+            }
+        }
+        total
+    }
+    match app.path().app_data_dir() {
+        Ok(dir) => walk(&dir),
+        Err(_) => 0,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -342,7 +370,8 @@ pub fn run() {
             sync_email,
             set_sync_email,
             park_conflict,
-            usage
+            usage,
+            cache_size
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
