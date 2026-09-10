@@ -47,16 +47,16 @@ function Find-WindowsKitTool {
   throw "$ToolName not found under $kitsRoot"
 }
 
-# Build the self-contained exe if it isn't there yet.
+# ALWAYS build. This used to build only when the exe was missing, which shipped
+# 0.1.8.0 to the Store with the 0.1.7 app inside it: the leftover exe was there,
+# so nothing was compiled and only the manifest version changed.
 $ExeName = "notestash.exe"
 $ReleaseExe = Join-Path $ReleaseDir $ExeName
-if (-not (Test-Path $ReleaseExe)) {
-  Push-Location $Root
-  try {
-    if ($RustTarget) { npm run tauri build -- --no-bundle --target $RustTarget }
-    else { npm run tauri build -- --no-bundle }
-  } finally { Pop-Location }
-}
+Push-Location $Root
+try {
+  if ($RustTarget) { npm run tauri build -- --no-bundle --target $RustTarget }
+  else { npm run tauri build -- --no-bundle }
+} finally { Pop-Location }
 if (-not (Test-Path $ReleaseExe)) {
   $exe = Get-ChildItem -LiteralPath $ReleaseDir -Filter *.exe -File |
     Where-Object { $_.Name -notlike "*setup*" } | Select-Object -First 1

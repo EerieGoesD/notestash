@@ -315,16 +315,65 @@ async function pdfToText(base64: string): Promise<string> {
 // A body is stored as HTML. Notes written before rich text are plain text, so
 // everything that reads a body goes through these.
 const looksLikeHtml = (s: string) =>
-  /<(br|div|p|ul|ol|li|pre|strong|b|em|i|s|strike|code|span)\b[^>]*>/i.test(s);
+  /<(br|div|p|ul|ol|li|pre|strong|b|em|i|s|strike|code|span|a)\b[^>]*>/i.test(s);
+
+// A web address sitting in ordinary text. The last character class stops a full
+// stop or a closing bracket at the end of a sentence joining the link.
+const URL_IN_TEXT = /\b(?:https?:\/\/|www\.)[^\s<>"']*[^\s<>"'.,;:!?)\]}]/gi;
+
+/** http and https only. Anything else (javascript:, data:) is not a link. */
+function safeHref(raw: string): string | null {
+  const url = raw.trim();
+  if (!url) return null;
+  const full = /^https?:\/\//i.test(url) ? url : `https://${url.replace(/^\/+/, "")}`;
+  try {
+    const parsed = new URL(full);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Turns bare web addresses into links, so a note written before this existed
+ * and one written today both end up clickable. Works on the HTML string
+ * outside of tags, and leaves anything already inside a link or a code block
+ * exactly as it is.
+ */
+function linkify(html: string): string {
+  if (!html || !/(?:https?:\/\/|www\.)/i.test(html)) return html;
+  let out = "";
+  let depth = 0;
+  for (const piece of html.split(/(<[^>]*>)/)) {
+    if (piece.startsWith("<")) {
+      const tag = piece.toLowerCase();
+      if (/^<(a|pre)\b/.test(tag)) depth += 1;
+      else if (/^<\/(a|pre)>/.test(tag)) depth = Math.max(0, depth - 1);
+      out += piece;
+    } else if (depth > 0 || !piece) {
+      out += piece;
+    } else {
+      out += piece.replace(URL_IN_TEXT, (match) => {
+        const href = safeHref(match);
+        return href
+          ? `<a href="${href.replace(/"/g, "&quot;")}" rel="noreferrer">${match}</a>`
+          : match;
+      });
+    }
+  }
+  return out;
+}
 
 function bodyToHtml(body: string): string {
   if (!body) return "";
-  if (looksLikeHtml(body)) return body;
-  return body
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\n/g, "<br>");
+  if (looksLikeHtml(body)) return linkify(body);
+  return linkify(
+    body
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/\n/g, "<br>")
+  );
 }
 
 // Plain text version, for search, the clipboard and the board dump.
@@ -3541,6 +3590,12 @@ function RichEditor({
   const [empty, setEmpty] = useState(() => bodyIsEmpty(html));
   // Which buttons are lit for whatever the caret is currently sitting in.
   const [on, setOn] = useState<Record<string, boolean>>({});
+  // The link window. Typing in it takes the caret out of the writing, so the
+  // selection is put aside when it opens and restored when it closes.
+  const [linkBar, setLinkBar] = useState(false);
+  const [linkValue, setLinkValue] = useState("");
+  const [linkText, setLinkText] = useState("");
+  const savedRange = useRef<Range | null>(null);
 
   useEffect(() => {
     if (ref.current) ref.current.innerHTML = bodyToHtml(html);
@@ -3563,6 +3618,7 @@ function RichEditor({
       insertUnorderedList: document.queryCommandState("insertUnorderedList"),
       insertOrderedList: document.queryCommandState("insertOrderedList"),
       pre: !!anchor.closest("pre"),
+      link: !!anchor.closest("a"),
     });
   }, []);
 
@@ -3592,6 +3648,77 @@ function RichEditor({
     const el = node instanceof Element ? node : (node?.parentElement ?? null);
     document.execCommand("formatBlock", false, el?.closest("pre") ? "div" : "pre");
     sync();
+  };
+
+  // Opens the address bar. The selection is remembered here, while the caret is
+  // still in the writing, and an existing link fills the box so it can be
+  // edited rather than retyped.
+  const openLinkBar = () => {
+    const sel = window.getSelection();
+    const range = sel && sel.rangeCount ? sel.getRangeAt(0) : null;
+    if (!range || !ref.current?.contains(range.commonAncestorContainer)) {
+      ref.current?.focus();
+      return;
+    }
+    savedRange.current = range.cloneRange();
+    const node = range.commonAncestorContainer;
+    const el = node instanceof Element ? node : node.parentElement;
+    const anchor = el?.closest("a");
+    setLinkValue(anchor?.getAttribute("href") ?? "");
+    // Whatever is selected becomes the words to show, so the usual case is:
+    // select the words, paste the address, done.
+    setLinkText(anchor ? (anchor.textContent ?? "") : range.toString());
+    setLinkBar(true);
+  };
+
+  const restoreRange = () => {
+    const range = savedRange.current;
+    if (!range) return false;
+    const sel = window.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+    ref.current?.focus();
+    return true;
+  };
+
+  const closeLinkBar = () => {
+    setLinkBar(false);
+    setLinkValue("");
+    setLinkText("");
+  };
+
+  const applyLink = () => {
+    const href = safeHref(linkValue);
+    if (!href) return;
+    if (!restoreRange()) return;
+    // The words are optional: with that box left empty the address shows itself.
+    const shown = (linkText.trim() || linkValue.trim())
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+    document.execCommand(
+      "insertHTML",
+      false,
+      `<a href="${href.replace(/"/g, "&quot;")}" rel="noreferrer">${shown}</a>&nbsp;`
+    );
+    closeLinkBar();
+    sync();
+  };
+
+  const removeLink = () => {
+    if (restoreRange()) document.execCommand("unlink");
+    closeLinkBar();
+    sync();
+  };
+
+  // A link inside the writing opens in the browser rather than putting the
+  // caret in the middle of it.
+  const onEditorClick = (e: ReactMouseEvent<HTMLDivElement>) => {
+    const anchor = (e.target as HTMLElement).closest("a[href]");
+    if (!anchor) return;
+    e.preventDefault();
+    const href = safeHref(anchor.getAttribute("href") ?? "");
+    if (href) void openUrl(href).catch(() => {});
   };
 
   // Paste as plain text so outside formatting never leaks in. Image pastes are
@@ -3684,7 +3811,87 @@ function RichEditor({
           ),
           () => run("insertOrderedList")
         )}
+        {tool(
+          "link",
+          "Link",
+          svg(
+            <>
+              <path d="M10 13.5a3.5 3.5 0 0 0 5 0l3-3a3.5 3.5 0 0 0-5-5l-1.5 1.5" />
+              <path d="M14 10.5a3.5 3.5 0 0 0-5 0l-3 3a3.5 3.5 0 0 0 5 5l1.5-1.5" />
+            </>
+          ),
+          openLinkBar
+        )}
       </div>
+      {linkBar && (
+        <div className="modal-overlay" onClick={(e) => e.stopPropagation()}>
+          <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="settings-head">
+              <h2 className="settings-title">{on.link ? "Edit link" : "Add a link"}</h2>
+              <span className="settings-control">
+                <button
+                  type="button"
+                  className="settings-close"
+                  title="Close"
+                  onClick={closeLinkBar}
+                >
+                  <CloseIcon />
+                </button>
+              </span>
+            </div>
+            <label className="link-field">
+              <span className="link-label">
+                Address <span className="link-required">*</span>
+              </span>
+              <input
+                autoFocus
+                className="account-input"
+                placeholder="Paste a web address"
+                value={linkValue}
+                onChange={(e) => setLinkValue(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key !== "Enter") return;
+                  e.preventDefault();
+                  applyLink();
+                }}
+              />
+            </label>
+            <label className="link-field">
+              <span className="link-label">Words to show (optional)</span>
+              <input
+                className="account-input"
+                placeholder="What the link says"
+                value={linkText}
+                onChange={(e) => setLinkText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key !== "Enter") return;
+                  e.preventDefault();
+                  applyLink();
+                }}
+              />
+              <span className="link-hint">Left empty, the note shows the address itself.</span>
+            </label>
+            <div className="modal-actions">
+              {on.link && (
+                <button className="btn btn-ghost danger" onClick={removeLink}>
+                  Remove link
+                </button>
+              )}
+              <div className="spacer" />
+              <button className="btn btn-ghost" onClick={closeLinkBar}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-accent"
+                disabled={!safeHref(linkValue)}
+                onClick={applyLink}
+              >
+                Insert
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <div
         ref={ref}
         className={"modal-body rt-editor" + (empty ? " is-empty" : "")}
@@ -3694,6 +3901,7 @@ function RichEditor({
         onInput={sync}
         onBlur={sync}
         onPaste={onPaste}
+        onClick={onEditorClick}
       />
     </div>
   );
