@@ -584,9 +584,12 @@ body {
 .card.is-dragging { opacity: 0.35; }
 .card-ghost {
   position: fixed;
+  left: 0;
+  top: 0;
   z-index: 200;
   pointer-events: none;
-  transform: rotate(2.5deg);
+  /* Placed and tilted by an inline transform that follows the pointer. */
+  will-change: transform;
 }
 .card-ghost .card {
   margin: 0;

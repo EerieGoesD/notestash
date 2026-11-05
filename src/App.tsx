@@ -691,6 +691,10 @@ export default function App() {
   const dragCardIdRef = useRef<string | null>(null);
   const cardPointerRef = useRef<{ x: number; y: number } | null>(null);
   const cardScrollRafRef = useRef<number | null>(null);
+  // The floating card under the pointer. It is moved straight on the page every
+  // pointer move; going through React state redrew the whole app each time,
+  // which is what made it trail behind the mouse.
+  const ghostRef = useRef<HTMLDivElement | null>(null);
   const boardDraggedRef = useRef(false);
 
   const activeBoard =
@@ -1735,6 +1739,21 @@ export default function App() {
     }
   };
 
+  // Scroll the board sideways when the drag pointer nears its left/right edge,
+  // so a column off screen can be reached. Past the edge counts as full speed.
+  const autoScrollBoard = (board: HTMLElement, clientX: number) => {
+    const r = board.getBoundingClientRect();
+    const edge = 80;
+    const maxSpeed = 24;
+    if (clientX < r.left + edge) {
+      const d = Math.min(1, (r.left + edge - clientX) / edge);
+      board.scrollLeft -= Math.ceil(maxSpeed * d);
+    } else if (clientX > r.right - edge) {
+      const d = Math.min(1, (clientX - (r.right - edge)) / edge);
+      board.scrollLeft += Math.ceil(maxSpeed * d);
+    }
+  };
+
   // Figure out which column and insertion point the pointer is over, from the DOM.
   const updateCardDropTarget = (x: number, y: number, draggedId: string) => {
     const board = boardRef.current;
@@ -1779,12 +1798,13 @@ export default function App() {
     const loop = () => {
       const pos = cardPointerRef.current;
       if (pos) {
+        if (boardRef.current) autoScrollBoard(boardRef.current, pos.x);
         const el = document.elementFromPoint(pos.x, pos.y) as HTMLElement | null;
         const scroller = el?.closest<HTMLElement>(".cards");
-        if (scroller) {
-          autoScrollCards(scroller, pos.y);
-          if (dragCardIdRef.current) updateCardDropTarget(pos.x, pos.y, dragCardIdRef.current);
-        }
+        if (scroller) autoScrollCards(scroller, pos.y);
+        // Columns slide under a still pointer while the board scrolls, so the
+        // drop line is worked out again every frame, not only on movement.
+        if (dragCardIdRef.current) updateCardDropTarget(pos.x, pos.y, dragCardIdRef.current);
       }
       cardScrollRafRef.current = requestAnimationFrame(loop);
     };
@@ -1818,10 +1838,15 @@ export default function App() {
         if (Math.abs(ev.clientX - startX) < 5 && Math.abs(ev.clientY - startY) < 5) return;
         started = true;
         setDragCard({ cardId, fromColId: colId });
+        // Drawn once, at the pointer; every move after this only shifts it.
+        setDragGhost({ x: ev.clientX - grabX, y: ev.clientY - grabY, width });
         startCardScrollLoop();
       }
       cardPointerRef.current = { x: ev.clientX, y: ev.clientY };
-      setDragGhost({ x: ev.clientX - grabX, y: ev.clientY - grabY, width });
+      const g = ghostRef.current;
+      if (g) {
+        g.style.transform = `translate3d(${ev.clientX - grabX}px, ${ev.clientY - grabY}px, 0) rotate(2.5deg)`;
+      }
       updateCardDropTarget(ev.clientX, ev.clientY, cardId);
     };
     const onWheel = (ev: WheelEvent) => {
@@ -2678,8 +2703,12 @@ export default function App() {
           const gc = findCard(dragCard.fromColId, dragCard.cardId);
           return gc ? (
             <div
+              ref={ghostRef}
               className="card-ghost"
-              style={{ left: dragGhost.x, top: dragGhost.y, width: dragGhost.width }}
+              style={{
+                width: dragGhost.width,
+                transform: `translate3d(${dragGhost.x}px, ${dragGhost.y}px, 0) rotate(2.5deg)`,
+              }}
             >
               <div className="card">
                 <CardContent card={gc} labels={labels} cardView={cardView} />
