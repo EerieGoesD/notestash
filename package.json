@@ -1,7 +1,7 @@
 {
   "name": "notestash",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A fast, local note board - jot quick notes into categories and drag them around like Trello.",
   "type": "module",
   "scripts": {

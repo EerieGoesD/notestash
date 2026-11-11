@@ -1232,11 +1232,36 @@ export default function App() {
   };
 
   // ── Column operations (on the active board) ──
-  const addColumn = () =>
+  // What to bring into view once the board has redrawn: a column just added
+  // sits off to the right, a note just added sits at the bottom of its column.
+  const revealRef = useRef<"end" | { colId: string } | null>(null);
+  useEffect(() => {
+    const want = revealRef.current;
+    if (!want) return;
+    revealRef.current = null;
+    // A frame later, so the composer has folded back up and the column is its
+    // final height before measuring how far down to go.
+    requestAnimationFrame(() => {
+      const board = boardRef.current;
+      if (!board) return;
+      if (want === "end") {
+        board.scrollTo({ left: board.scrollWidth, behavior: "smooth" });
+        return;
+      }
+      const cards = board.querySelector<HTMLElement>(
+        `.column[data-col-id="${CSS.escape(want.colId)}"] .cards`
+      );
+      cards?.scrollTo({ top: cards.scrollHeight, behavior: "smooth" });
+    });
+  }, [workspace]);
+
+  const addColumn = () => {
+    revealRef.current = "end";
     updateActiveBoard((b) => ({
       ...b,
       columns: [...b.columns, { id: uid(), title: "New column", cards: [] }],
     }));
+  };
 
   const renameColumn = (colId: string, title: string) =>
     updateActiveBoard((b) => ({
@@ -1389,6 +1414,7 @@ export default function App() {
   const addCard = (colId: string, title: string, body: string) => {
     const t = title.trim();
     if (!t) return;
+    revealRef.current = { colId };
     const card: Card = {
       id: uid(),
       title: t,
