@@ -623,7 +623,9 @@ export default function App() {
   );
   // Card whose copy button was just used, so it can show a tick briefly.
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [copyMenu, setCopyMenu] = useState<{ card: Card; x: number; y: number } | null>(null);
+  const [copyMenu, setCopyMenu] = useState<
+    { card?: Card; col?: Column; x: number; y: number } | null
+  >(null);
   const [sidebarOpen, setSidebarOpen] = useState(
     () => localStorage.getItem("notestash.sidebar") !== "closed"
   );
@@ -1971,6 +1973,38 @@ export default function App() {
     }
   };
 
+  // One column's notes as text, laid out the same way as Copy board.
+  const copyColumnToClipboard = async (col: Column, mode: "title" | "both") => {
+    const lines: string[] = [`Column: ${col.title}`];
+    col.cards.forEach((card, i) => {
+      lines.push(`Note #${i + 1} Title: ${card.title || "Untitled note"}`);
+      if (mode === "both") {
+        const text = bodyToText(card.body);
+        if (text) lines.push(`Note #${i + 1} Description: ${text}`);
+      }
+    });
+    const text = lines.join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+      } catch {
+        // nothing else to try
+      }
+      document.body.removeChild(ta);
+    }
+    setCopiedId(col.id);
+    window.setTimeout(() => setCopiedId((id) => (id === col.id ? null : id)), 1200);
+    flash("Column copied");
+  };
+
   // Plain-text dump of the whole board, for pasting elsewhere.
   const copyCurrentBoard = async () => {
     const lines: string[] = [`Board: ${activeBoard.title}`];
@@ -2401,6 +2435,16 @@ export default function App() {
                 <div className="column-tools">
                   <button
                     className="icon-btn"
+                    title="Copy column"
+                    onClick={(e) => {
+                      const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                      setCopyMenu({ col, x: r.right, y: r.bottom + 4 });
+                    }}
+                  >
+                    {copiedId === col.id ? "✓" : "⧉"}
+                  </button>
+                  <button
+                    className="icon-btn"
                     title="Move left"
                     disabled={colIndex === 0}
                     onClick={() => animateColMove(colIndex, colIndex - 1)}
@@ -2797,20 +2841,22 @@ export default function App() {
             <button
               className="context-menu-open"
               onClick={() => {
-                copyCardToClipboard(copyMenu.card, "title");
+                if (copyMenu.col) copyColumnToClipboard(copyMenu.col, "title");
+                else if (copyMenu.card) copyCardToClipboard(copyMenu.card, "title");
                 setCopyMenu(null);
               }}
             >
-              Copy title only
+              {copyMenu.col ? "Copy titles only" : "Copy title only"}
             </button>
             <button
               className="context-menu-open"
               onClick={() => {
-                copyCardToClipboard(copyMenu.card, "both");
+                if (copyMenu.col) copyColumnToClipboard(copyMenu.col, "both");
+                else if (copyMenu.card) copyCardToClipboard(copyMenu.card, "both");
                 setCopyMenu(null);
               }}
             >
-              Copy title + description
+              {copyMenu.col ? "Copy titles + descriptions" : "Copy title + description"}
             </button>
           </div>
         </>
