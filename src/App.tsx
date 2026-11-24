@@ -651,6 +651,8 @@ export default function App() {
   const compressRun = useRef(0);
   const [showCache, setShowCache] = useState(false);
   const [sortMenu, setSortMenu] = useState(false);
+  // Filters the sidebar's board list by name.
+  const [boardQuery, setBoardQuery] = useState("");
   const [exportMenu, setExportMenu] = useState<{ x: number; y: number } | null>(null);
   const [dragBoardId, setDragBoardId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -2215,8 +2217,29 @@ export default function App() {
               </div>
             </div>
           </div>
+          <div className="board-search-wrap">
+            <input
+              className="board-search"
+              placeholder="Search boards"
+              value={boardQuery}
+              onChange={(e) => setBoardQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setBoardQuery("");
+              }}
+            />
+          </div>
           <div className="board-list">
-            {workspace.boards.map((b) => (
+            {boardQuery.trim() &&
+              !workspace.boards.some((b) =>
+                b.title.toLowerCase().includes(boardQuery.trim().toLowerCase())
+              ) && <div className="board-search-empty">No boards match</div>}
+            {workspace.boards
+              .filter(
+                (b) =>
+                  !boardQuery.trim() ||
+                  b.title.toLowerCase().includes(boardQuery.trim().toLowerCase())
+              )
+              .map((b) => (
               <div
                 key={b.id}
                 data-board-id={b.id}

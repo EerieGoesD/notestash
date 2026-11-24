@@ -274,6 +274,22 @@ body {
   background: var(--surface2);
   opacity: 0.55;
 }
+.board-search-wrap { padding: 0 8px 6px; }
+.board-search {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.board-search:focus { border-color: var(--accent); }
+.board-search::placeholder { color: var(--text-dim); }
+.board-search-empty { padding: 6px 8px; font-size: 12px; color: var(--text-dim); }
 .board-list {
   flex: 1 1 0;
   min-height: 40px;
